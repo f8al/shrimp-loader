@@ -127,8 +127,11 @@ def main():
             template
         )
 
-    # Write output
-    with open(output_path, "w") as f:
+    # Strip any non-ASCII characters that could corrupt during transfer
+    template = template.encode("ascii", errors="ignore").decode("ascii")
+
+    # Write output as ASCII to prevent encoding issues on Windows
+    with open(output_path, "w", encoding="ascii") as f:
         f.write(template)
 
     print(f"[+] Written: {output_path}", file=sys.stderr)
