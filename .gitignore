@@ -10,6 +10,11 @@ msbuild_ready.csproj
 msbuild.csproj
 payload_ready.cs
 payload_ready.dll
+payload_ready.exe
+workflow_ready.cs
+workflow_ready.xoml
+workflow_input_ready.xml
+payload.snk
 *.bin
 
 # Encrypted payload files

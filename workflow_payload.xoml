@@ -1,0 +1,2 @@
+<SequentialWorkflowActivity x:Class="Run" x:Name="Run" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/workflow">
+</SequentialWorkflowActivity>
