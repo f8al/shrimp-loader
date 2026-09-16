@@ -199,7 +199,8 @@ def main():
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = args.template or os.path.join(script_dir, "regsvcs_payload.cs")
-    output_path = args.output or os.path.join(script_dir, "payload_ready.cs")
+    output_path = args.output or os.path.join(script_dir, "output", "payload_ready.cs")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if not os.path.exists(args.assembly):
         print(f"[-] Assembly not found: {args.assembly}", file=sys.stderr)
@@ -330,7 +331,7 @@ def main():
     # --- Optional compile (requires strong naming) ---
 
     dll_path = os.path.splitext(output_path)[0] + ".dll"
-    snk_path = args.keyfile or os.path.join(script_dir, "payload.snk")
+    snk_path = args.keyfile or os.path.join(os.path.dirname(output_path), "payload.snk")
 
     if args.compile:
         mcs = shutil.which("mcs")
