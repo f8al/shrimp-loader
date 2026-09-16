@@ -8,6 +8,9 @@ bin/
 # Generated payloads (contain encrypted assemblies)
 msbuild_ready.csproj
 msbuild.csproj
+payload_ready.cs
+payload_ready.dll
+*.bin
 
 # Encrypted payload files
 *.enc
