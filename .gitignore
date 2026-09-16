@@ -22,3 +22,5 @@ __pycache__/
 *.py[codz]
 *.egg-info/
 .venv/
+AGENT.md
+HANDOFF.md

