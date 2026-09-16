@@ -1,6 +1,6 @@
 # Shrimp Loader
 
-In-memory .NET assembly loader for Windows 11. Reflectively loads and executes .NET assemblies without touching disk, using the CLR Hosting API — the same core technique behind `execute-assembly` in commercial C2 frameworks.
+In-memory .NET assembly loader for Windows 11. Reflectively loads and executes .NET assemblies (EXEs and DLLs) without touching disk, using the CLR Hosting API — the same core technique behind `execute-assembly` in commercial C2 frameworks.
 
 ## How It Works
 
@@ -16,9 +16,9 @@ Unmanaged Host Process
   ├─ Patch AmsiScanBuffer      ← prevent Assembly.Load scanning
   ├─ CreateDomain()            ← isolated AppDomain
   ├─ AppDomain.Load(byte[])   ← assembly loaded IN MEMORY
-  ├─ EntryPoint.Invoke()       ← execute
+  ├─ Invoke                    ← EntryPoint for EXEs, Type.Method for DLLs
   ├─ UnloadDomain()            ← cleanup loaded assembly metadata
-  └─ SecureZeroMemory()        ← wipe decrypted bytes
+  └─ SecureZeroMemory()        ← wipe decrypted bytes + key material
 ```
 
 ## Components
@@ -64,9 +64,11 @@ Unmanaged Host Process
 # macOS
 brew install mingw-w64    # C++ cross-compiler
 brew install mono          # C# compiler (for InstallUtil payload)
+pip install cryptography   # AES encryption (not needed for XOR mode)
 
 # Linux
 apt install mingw-w64 mono-devel
+pip install cryptography
 ```
 
 ### Build
@@ -88,12 +90,41 @@ make all32
 ### MSBuild Payload (recommended for targets with application whitelisting)
 
 ```bash
-# One command: encrypt + inject into MSBuild template
+# EXE — encrypt + inject into MSBuild template
 python build_msbuild.py Seatbelt.exe -- -group=all
+
+# DLL — specify type and method to invoke
+python build_msbuild.py MyLib.dll --type Namespace.Class --method Execute
+python build_msbuild.py MyLib.dll --type Namespace.Class --method Run -- arg1 arg2
+
+# Choose encryption method (default: AES-256-CBC)
+python build_msbuild.py Seatbelt.exe -e aes -- -group=all
+python build_msbuild.py Seatbelt.exe -e xor -- -group=all
+
+# Supply your own key material
+python build_msbuild.py Seatbelt.exe --key <64-hex> --iv <32-hex> -- -group=all
 
 # On target:
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe msbuild_ready.csproj
 ```
+
+### Supported Assembly Types
+
+| Type | Invocation | Example |
+|------|-----------|---------|
+| **.NET EXE** (with `Main()`) | Automatic via `EntryPoint` | `build_msbuild.py Seatbelt.exe -- -group=all` |
+| **.NET DLL** (class library) | `--type` + `--method` | `build_msbuild.py MyLib.dll --type NS.Class --method Run` |
+
+DLL mode resolves public and non-public methods, static and instance. Instance methods are invoked on a new instance created via `Activator.CreateInstance()`. Arguments after `--` are passed as `string[]` if the method signature accepts them.
+
+### Encryption
+
+| Method | Flag | Key Size | Notes |
+|--------|------|----------|-------|
+| AES-256-CBC | `-e aes` (default) | 32 bytes | RijndaelManaged on target, `cryptography` package on operator side |
+| XOR | `-e xor` | Any (default 16 bytes) | No dependencies, useful for testing weaker encryption detection |
+
+All key material (key, IV, ciphertext) is zeroed after use via `Array.Clear()`.
 
 ### Embedded Payload
 
@@ -154,10 +185,10 @@ The order matters:
 1. **Patch ETW** — before CLR starts, prevents .NET runtime telemetry
 2. **Start CLR** — `LoadLibrary("mscoree.dll")` + `ICorRuntimeHost::Start()`
 3. **Patch AMSI** — after CLR start (amsi.dll is now loaded as a side effect)
-4. **Decrypt payload** — XOR/AES decrypt into VirtualAlloc'd buffer
+4. **Decrypt payload** — AES-256-CBC or XOR decrypt into buffer
 5. **AppDomain.Load(byte[])** — AMSI patched, won't scan
-6. **EntryPoint.Invoke()** — ETW patched, won't log
-7. **Wipe + UnloadDomain** — SecureZeroMemory, VirtualFree, unload AppDomain
+6. **Invoke** — `EntryPoint.Invoke()` for EXEs, `Type.GetMethod().Invoke()` for DLLs
+7. **Wipe + UnloadDomain** — `Array.Clear` key material and decrypted bytes, unload AppDomain
 
 ## Cross-Compilation Notes
 
